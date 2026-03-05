@@ -17,6 +17,7 @@
 - `search_x.py`：Playwright + 登录态文件抓取
 - `search_with_existing_chrome.py`：连接已有 Chrome（CDP）抓取
 - `crawl_user_timeline.py`：按用户主页滚动抓取历史推文并生成详细分析报告
+- `crawl_user_following.py`：抓取某用户关注的账号列表并生成详细分析报告
 - `login_x.py`：登录并保存会话状态
 - `html_report.py`：深度分析与 HTML 文章生成
 
@@ -80,6 +81,21 @@ python crawl_user_timeline.py \
 - 抓取数量：`300`
 - 输出目录示例：`output/user_vista8_1772696133_cookie/`
 
+### 方案 D：抓取某用户关注列表并分析（示例：`@vista8`）
+
+```bash
+python crawl_user_following.py \
+  --user-url "https://x.com/vista8" \
+  --state auth_state.json \
+  --max-items 0 \
+  --max-scrolls 1200 \
+  --no-new-stop 35
+```
+
+说明：
+- `--max-items 0` 表示尽可能全量抓取，直到滚动无新增为止（受平台加载策略影响，不保证绝对全量）。
+- 结果会生成关注账号明细与详细统计分析。
+
 ## 输出结果
 
 每次运行生成目录：
@@ -92,6 +108,7 @@ output/<关键词>_<时间戳>/
   ├── summary.md
   ├── article.html
   └── article_analysis.json
+```
 
 用户历史抓取还会额外生成：
 
@@ -101,6 +118,16 @@ output/user_<handle>_<时间戳>/
   ├── detailed_report.md
   └── detailed_report.html
 ```
+
+用户关注抓取会额外生成：
+
+```text
+output/following_<handle>_<时间戳>/
+  ├── results.json
+  ├── results.csv
+  ├── detailed_report.json
+  ├── detailed_report.md
+  └── detailed_report.html
 ```
 
 ## 常见问题
