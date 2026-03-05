@@ -75,6 +75,11 @@ python crawl_user_timeline.py \
 - `--max-items 0` 表示不设硬上限，滚动到页面无新增为止（受平台加载策略影响，不保证绝对全量）。
 - 可加 `--with-replies` 抓取 `with_replies` 时间线。
 
+实测示例（本地）：
+- 目标：`https://x.com/vista8`
+- 抓取数量：`300`
+- 输出目录示例：`output/user_vista8_1772696133_cookie/`
+
 ## 输出结果
 
 每次运行生成目录：
