@@ -25,10 +25,14 @@ python search_x.py --keyword "信息差" --max-items 300 --sort Latest --state a
 ### 2) 一键爬某用户历史推文（示例：vista8）
 
 ```bash
-python crawl_user_timeline.py --user-url "https://x.com/vista8" --state auth_state.json --max-items 300 --max-scrolls 500 --no-new-stop 25
+python crawl_user_timeline.py --user-url "https://x.com/vista8" --state auth_state.json --max-items 0 --max-scrolls 3000 --no-new-stop 50
 ```
 
 输出目录：`output/user_<handle>_<时间戳>/`
+
+说明：
+- `--max-items 0` = 不设条数上限，尽量抓全历史（受平台可见性与风控影响，不保证绝对全量）。
+- 最近一次本地实测 `@vista8`：抓取 `435` 条，目录示例：`output/user_vista8_1772702515_cookie_full/`。
 
 ### 3) 一键爬某用户关注列表（示例：vista8）
 
