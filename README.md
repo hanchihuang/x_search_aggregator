@@ -4,6 +4,19 @@
 
 ## 功能概览
 
+## 是否需要 X 开发者账号
+
+不一定。项目支持两条路线：
+
+- 官方 API 路线（`search_x_api.py`）：需要 X 开发者账号与 Bearer Token。
+- 网页会话路线（`search_x.py` / `crawl_user_timeline.py` / `crawl_user_following.py`）：不需要开发者账号，基于你已登录的 X 网页会话（可通过 F12 抓包确认请求）。
+
+说明：
+- 网页会话路线更贴近你当前使用方式（F12）。
+- 但网页端接口会变化，且可能遇到风控；稳定性通常低于官方 API。
+- 请勿泄露 `auth_token`、`ct0` 等敏感信息。
+
+
 - 关键词抓取（Latest / Top）
 - 可自定义滚动翻页爬取，爬多少由你控制（如 `--max-items`、`--max-scrolls`）
 - API 模式与浏览器模式双支持
