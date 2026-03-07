@@ -23,6 +23,18 @@
 - 任务关闭页面后仍保留，服务重启后会从磁盘恢复状态
 - 所有结果落地为 `JSON / CSV / Markdown / HTML`
 
+## 🧾 最终产出长什么样
+
+下面不是后台截图，而是系统最终生成的 HTML 成品页：
+
+**有用程度排序页**
+
+![Demo Ranking](assets/demo-ranking.jpg)
+
+**深度文章页**
+
+![Demo Article](assets/demo-article.jpg)
+
 ## 🖥️ 像产品一样使用
 
 ### 1. 安装
@@ -68,16 +80,6 @@ python web_app.py
 **任务运行中**
 
 ![Web Console Task](assets/web-console-task.png)
-
-## 🧾 Demo Output
-
-**有用程度排序页**
-
-![Demo Ranking](assets/demo-ranking.jpg)
-
-**深度文章页**
-
-![Demo Article](assets/demo-article.jpg)
 
 ## ⚡ 典型工作流
 
