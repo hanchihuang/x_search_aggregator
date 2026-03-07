@@ -69,6 +69,16 @@ python web_app.py
 
 ![Web Console Task](assets/web-console-task.png)
 
+## 🧾 Demo Output
+
+**有用程度排序页**
+
+![Demo Ranking](assets/demo-ranking.jpg)
+
+**深度文章页**
+
+![Demo Article](assets/demo-article.jpg)
+
 ## ⚡ 典型工作流
 
 ### 关键词专题页
