@@ -70,6 +70,16 @@ python web_app.py
 
 前端控制台依赖 `Flask`，已经包含在 `requirements.txt` 中。
 
+#### 📷 界面预览
+
+**控制台首页**
+
+![Web Console Home](assets/web-console-home.png)
+
+**任务运行中**
+
+![Web Console Task](assets/web-console-task.png)
+
 #### 🔎 关键词搜索最新 500 条
 
 ```bash
