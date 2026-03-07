@@ -1,12 +1,13 @@
 <p align="center">
   <h1 align="center">🔍 X Search Aggregator</h1>
   <p align="center">
-    <b>全自动 X (Twitter) 数据采集 & 分析工具集</b><br/>
-    关键词搜索 · 用户历史推文 · 关注列表 · 关注者动态 · 一键500条
+    <b>把 X 上的关键词、关注流和高价值内容，直接变成可读的 HTML 页面</b><br/>
+    浏览器控制台 · 异步抓取 · 实时进度 · 排名排序 · 本地持久化
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white" alt="Python"/>
     <img src="https://img.shields.io/badge/Playwright-自动化-2EAD33?logo=playwright&logoColor=white" alt="Playwright"/>
+    <img src="https://img.shields.io/badge/Flask-Frontend_Control-111827?logo=flask&logoColor=white" alt="Flask"/>
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License"/>
     <img src="https://img.shields.io/badge/Platform-X.com-000000?logo=x&logoColor=white" alt="X.com"/>
   </p>
@@ -14,26 +15,17 @@
 
 ---
 
-## ✨ 功能亮点
+## ✨ 它能做什么
 
-| 功能 | 脚本 | 说明 |
-|------|------|------|
-| 🔎 **关键词搜索** | `search_x.py` | 按关键词搜索 X，自定义数量，支持语言过滤 |
-| 🔎 **关键词搜索 Top 500** | `search_keyword_500.py` | 一键抓取关键词最新 **500 条**推文 |
-| 📜 **用户历史推文** | `crawl_user_timeline.py` | 爬取任意用户的全部历史推文 |
-| 👥 **用户关注列表** | `crawl_user_following.py` | 通过内部 API 爬取用户完整关注列表 |
-| 📡 **关注者最新动态 500** | `crawl_following_timeline_500.py` | 一键抓取你关注的所有人的最新 **500 条**动态 |
-| 📊 **有用程度排名** | `rank_usefulness.py` | 对任意采集结果按有用程度智能评分，生成可视化排名 HTML |
-| 🖥️ **本地前端控制台** | `web_app.py` | 浏览器里输入关键词 / 点击按钮执行抓取，异步查看进度、日志和 HTML 结果 |
-| 🔑 **登录状态管理** | `login_x.py` | 一次登录，持久化 session，后续全自动 |
+- 输入一个关键词，自动抓取最新内容并生成 HTML 文章页
+- 一键抓取你关注的所有人最新动态，再按“有用程度”排序
+- 在浏览器里查看任务进度、滚动轮次、已抓条数、最近新增条数
+- 任务关闭页面后仍保留，服务重启后会从磁盘恢复状态
+- 所有结果落地为 `JSON / CSV / Markdown / HTML`
 
-> **无需 X 开发者账号**，基于浏览器已登录会话自动化采集，零 API 配额限制。
+## 🖥️ 像产品一样使用
 
----
-
-## 🚀 快速开始
-
-### 1. 安装（一次性）
+### 1. 安装
 
 ```bash
 git clone https://github.com/hhchhchhchhc/x_search_aggregator.git
@@ -52,7 +44,59 @@ python login_x.py --state auth_state.json --timeout 180
 
 > 会打开浏览器窗口，手动完成登录即可，登录状态自动保存。
 
-### 3. 开始使用
+### 3. 启动本地控制台
+
+```bash
+python web_app.py
+```
+
+然后打开 `http://127.0.0.1:8080`
+
+### 4. 在页面里完成操作
+
+- 输入关键词，生成专题 HTML
+- 点击关注流任务，生成关注者动态排序页
+- 在同一个页面里看任务日志、进度条和历史任务
+- 直接点击生成结果打开 HTML
+
+## 📷 界面预览
+
+**控制台首页**
+
+![Web Console Home](assets/web-console-home.png)
+
+**任务运行中**
+
+![Web Console Task](assets/web-console-task.png)
+
+## ⚡ 典型工作流
+
+### 关键词专题页
+
+`输入关键词 -> 抓取最新 500 条 -> 生成 article.html -> 生成 usefulness_ranking.html`
+
+### 关注流高价值排序
+
+`抓取 Following 时间线 -> 聚合最新动态 -> 评分排序 -> 输出排名 HTML`
+
+## ✨ 功能矩阵
+
+| 功能 | 脚本 | 说明 |
+|------|------|------|
+| 🔎 **关键词搜索** | `search_x.py` | 按关键词搜索 X，自定义数量，支持语言过滤 |
+| 🔎 **关键词搜索 Top 500** | `search_keyword_500.py` | 一键抓取关键词最新 **500 条**推文 |
+| 📜 **用户历史推文** | `crawl_user_timeline.py` | 爬取任意用户的全部历史推文 |
+| 👥 **用户关注列表** | `crawl_user_following.py` | 通过内部 API 爬取用户完整关注列表 |
+| 📡 **关注者最新动态 500** | `crawl_following_timeline_500.py` | 一键抓取你关注的所有人的最新 **500 条**动态 |
+| 📊 **有用程度排名** | `rank_usefulness.py` | 对任意采集结果按有用程度智能评分，生成可视化排名 HTML |
+| 🖥️ **本地前端控制台** | `web_app.py` | 浏览器里输入关键词 / 点击按钮执行抓取，异步查看进度、日志和 HTML 结果 |
+| 🔑 **登录状态管理** | `login_x.py` | 一次登录，持久化 session，后续全自动 |
+
+> **无需 X 开发者账号**，基于浏览器已登录会话自动化采集，零 API 配额限制。
+
+---
+
+## 🚀 命令行入口
 
 #### 🖥️ 本地前端控制台
 
@@ -69,16 +113,6 @@ python web_app.py
 - 页面关闭或服务重启后，任务状态会从磁盘恢复
 
 前端控制台依赖 `Flask`，已经包含在 `requirements.txt` 中。
-
-#### 📷 界面预览
-
-**控制台首页**
-
-![Web Console Home](assets/web-console-home.png)
-
-**任务运行中**
-
-![Web Console Task](assets/web-console-task.png)
 
 #### 🔎 关键词搜索最新 500 条
 
