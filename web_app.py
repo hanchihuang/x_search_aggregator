@@ -620,8 +620,6 @@ def run_email_job(task_id: str, params: Dict) -> None:
     run_dir = resolve_run_dir(str(params.get("run_name", "")))
     all_files = {item["name"]: Path(item["path"]) for item in run_report_files(run_dir)}
     selected_names = [str(item).strip() for item in params.get("attachments", []) if str(item).strip()]
-    if not selected_names:
-        raise ValueError("请至少选择一个附件。")
     attachments: List[Path] = []
     for name in selected_names:
         if name not in all_files:
@@ -631,7 +629,10 @@ def run_email_job(task_id: str, params: Dict) -> None:
     update_task(task_id, stage="正在连接 SMTP", progress=8, result_dir=str(run_dir))
     append_log(task_id, f"[SYSTEM] 目标收件人数: {len(recipients)}")
     append_log(task_id, f"[SYSTEM] 发送目录: {run_dir.name}")
-    append_log(task_id, f"[SYSTEM] 附件: {', '.join(path.name for path in attachments)}")
+    if attachments:
+        append_log(task_id, f"[SYSTEM] 附件: {', '.join(path.name for path in attachments)}")
+    else:
+        append_log(task_id, "[SYSTEM] 本次邮件不附带附件。")
     failures: List[str] = []
     total = len(recipients)
     for index, recipient in enumerate(recipients, start=1):
@@ -1566,7 +1567,7 @@ def render_page() -> str:
             </label>
           </div>
           <div class="selection-box">
-            <strong>要发送的附件</strong>
+            <strong>要发送的附件（可选）</strong>
             <div class="mini-note" id="attachmentHint">先选择一个输出目录。</div>
             <div class="option-list" id="attachmentList"></div>
           </div>
@@ -1575,7 +1576,7 @@ def render_page() -> str:
             <button class="btn alt" id="sendEmailBtn" type="button">一键批量发送</button>
           </div>
           <div id="mailerMessage"></div>
-          <div class="mini-note">SMTP 配置会保存在本地 `output/.web_mailer.json`。密码输入留空时，不会覆盖已保存值。</div>
+            <div class="mini-note">SMTP 配置会保存在本地 `output/.web_mailer.json`。密码输入留空时，不会覆盖已保存值。没有可选附件时，也可以直接发纯正文邮件。</div>
         </section>
 
         <section class="panel">

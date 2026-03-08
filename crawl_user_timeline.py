@@ -20,6 +20,7 @@ from html_report import write_html_article
 from search_x import (
     HASHTAG_RE,
     MENTION_RE,
+    TWEET_SELECTORS,
     create_context,
     extract_tweet,
     get_cards,
@@ -29,6 +30,7 @@ from search_x import (
     scroll_feed,
     summarize,
     validate_auth_state,
+    wait_for_search_results,
     write_summary_md,
 )
 
@@ -84,8 +86,97 @@ def normalize_item(item: Dict, card) -> Dict:
     return item
 
 
+def wait_for_timeline(page, timeout: int = 15000) -> bool:
+    if wait_for_search_results(page, timeout=timeout) and get_cards(page):
+        return True
+    for selector in TWEET_SELECTORS:
+        try:
+            page.wait_for_selector(selector, timeout=max(1000, timeout // max(1, len(TWEET_SELECTORS))))
+            if get_cards(page):
+                return True
+        except Exception:
+            continue
+    return bool(get_cards(page))
+
+
+def click_tab_by_labels(page, labels: List[str]) -> bool:
+    selectors = []
+    for label in labels:
+        selectors.extend(
+            [
+                f'[role="tab"]:has-text("{label}")',
+                f'a[role="tab"]:has-text("{label}")',
+                f'button:has-text("{label}")',
+                f'div[role="tab"]:has-text("{label}")',
+                f'a[href$="/{label.lower()}"]',
+            ]
+        )
+    for selector in selectors:
+        try:
+            target = page.locator(selector).first
+            if target.count() == 0:
+                continue
+            target.click(timeout=2500)
+            page.wait_for_timeout(2000)
+            if wait_for_timeline(page, timeout=8000):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def recover_timeline(
+    page,
+    target_url: str,
+    base_url: str,
+    with_replies: bool,
+    attempt: int,
+    scroll_pause: int,
+) -> bool:
+    strategy = attempt % 4
+    try:
+        if strategy == 0:
+            print("Recovery: nudge timeline and jump to end.")
+            page.evaluate("window.scrollBy(0, -Math.floor(window.innerHeight * 0.8))")
+            page.wait_for_timeout(900)
+            page.mouse.wheel(0, 2200)
+            page.keyboard.press("End")
+            page.wait_for_timeout(max(1800, scroll_pause))
+            return bool(get_cards(page))
+
+        if strategy == 1:
+            print(f"Recovery: reload {target_url}")
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_timeout(2200)
+            return wait_for_timeline(page)
+
+        if strategy == 2:
+            print(f"Recovery: revisit timeline {target_url}")
+            page.goto(target_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(2400)
+            return wait_for_timeline(page)
+
+        labels = ["Replies", "回复"] if with_replies else ["Posts", "推文", "帖子"]
+        print(f"Recovery: reopen profile {base_url} and retry tab {labels[0]}")
+        page.goto(base_url, wait_until="domcontentloaded")
+        page.wait_for_timeout(2200)
+        if with_replies and click_tab_by_labels(page, labels):
+            return True
+        if not with_replies and click_tab_by_labels(page, labels):
+            return True
+        page.goto(target_url, wait_until="domcontentloaded")
+        page.wait_for_timeout(2200)
+        return wait_for_timeline(page)
+    except Exception as exc:
+        print(f"Recovery attempt failed: {exc}")
+        return False
+
+
 def collect_user_tweets(
     page,
+    target_url: str,
+    base_url: str,
+    with_replies: bool,
     max_items: int,
     max_scrolls: int,
     no_new_stop: int,
@@ -95,6 +186,9 @@ def collect_user_tweets(
     no_new_rounds = 0
     anchor_stall_rounds = 0
     last_anchor = ""
+    recovery_attempts = 0
+    max_recoveries = 8
+    recovery_threshold = min(max(4, no_new_stop // 3), max(4, no_new_stop))
 
     for idx in range(max_scrolls):
         cards = get_cards(page)
@@ -134,6 +228,31 @@ def collect_user_tweets(
         if has_end_marker(page) and new_count == 0:
             print("Detected end marker on timeline. Stop scrolling.")
             break
+
+        should_recover = (
+            new_count == 0
+            and no_new_rounds >= recovery_threshold
+            and anchor_stall_rounds >= 2
+            and recovery_attempts < max_recoveries
+        )
+        if should_recover:
+            recovery_attempts += 1
+            recovered = recover_timeline(
+                page=page,
+                target_url=target_url,
+                base_url=base_url,
+                with_replies=with_replies,
+                attempt=recovery_attempts - 1,
+                scroll_pause=scroll_pause,
+            )
+            cards_after_recovery = len(get_cards(page))
+            print(
+                f"Recovery {recovery_attempts}/{max_recoveries}: recovered={recovered}, cards={cards_after_recovery}, total={len(seen)}"
+            )
+            if recovered:
+                no_new_rounds = 0
+                anchor_stall_rounds = 0
+                continue
 
         if no_new_rounds >= no_new_stop and anchor_stall_rounds >= 3:
             print(
@@ -387,8 +506,14 @@ def main() -> None:
             context.close()
             return
 
+        if not wait_for_timeline(page):
+            print("Warning: timeline content did not become visible after initial load.")
+
         items = collect_user_tweets(
             page=page,
+            target_url=target_url,
+            base_url=base_url,
+            with_replies=args.with_replies,
             max_items=args.max_items,
             max_scrolls=args.max_scrolls,
             no_new_stop=args.no_new_stop,
