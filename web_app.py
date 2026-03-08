@@ -4,33 +4,72 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import re
 import signal
+import shlex
+import smtplib
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from datetime import datetime
+from email.message import EmailMessage
+from email.utils import formataddr
 from pathlib import Path
 from typing import Dict, List, Tuple
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 TASKS_DB_PATH = BASE_DIR / "output" / ".web_tasks.json"
+INTEGRATIONS_DB_PATH = BASE_DIR / "output" / ".web_integrations.json"
+MAILER_DB_PATH = BASE_DIR / "output" / ".web_mailer.json"
 DEFAULT_STATE = "auth_state_cookie.json"
 LOG_LIMIT = 1200
 SCROLL_RE = re.compile(r"(?:滚动|Scroll)\s+(\d+)(?:/(\d+))?.*?共\s+(\d+)\s*条", re.IGNORECASE)
 TARGET_RE = re.compile(r"目标:\s*收集前\s*(\d+)\s*条")
 SUCCESS_RE = re.compile(r"成功收集\s+(\d+)\s+条推文(?:（目标:\s*(\d+)条）)?")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 app = Flask(__name__)
 
 TASKS: Dict[str, Dict] = {}
 TASKS_LOCK = threading.Lock()
+INTEGRATIONS: Dict[str, Dict] = {
+    "bettafish": {
+        "name": "BettaFish",
+        "path": str((BASE_DIR / "integrations" / "BettaFish").resolve()),
+        "python_cmd": "python",
+        "host": "127.0.0.1",
+        "port": 5000,
+        "status": "idle",
+        "message": "",
+        "error": "",
+        "logs": [],
+        "process": None,
+        "pid": None,
+        "updated_at": "",
+    }
+}
+INTEGRATIONS_LOCK = threading.Lock()
+MAILER: Dict[str, object] = {
+    "smtp_host": "mail.alumni.sjtu.edu.cn",
+    "smtp_port": 465,
+    "smtp_security": "ssl",
+    "username": "",
+    "password": "",
+    "sender_email": "",
+    "sender_name": "SJTU Alumni Mail",
+    "updated_at": "",
+}
+MAILER_LOCK = threading.Lock()
 
 
 def task_to_disk_record(task: Dict) -> Dict:
@@ -103,6 +142,521 @@ def load_tasks_from_disk() -> None:
             TASKS[task["id"]] = task
 
 
+def integration_to_disk_record(item: Dict) -> Dict:
+    return {
+        "name": item["name"],
+        "path": item.get("path", ""),
+        "python_cmd": item.get("python_cmd", "python"),
+        "host": item.get("host", "127.0.0.1"),
+        "port": int(item.get("port", 5000) or 5000),
+        "status": item.get("status", "idle"),
+        "message": item.get("message", ""),
+        "error": item.get("error", ""),
+        "logs": trim_logs(list(item.get("logs", []))),
+        "updated_at": item.get("updated_at", ""),
+    }
+
+
+def save_integrations_to_disk() -> None:
+    with INTEGRATIONS_LOCK:
+        payload = {name: integration_to_disk_record(item) for name, item in INTEGRATIONS.items()}
+    INTEGRATIONS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    INTEGRATIONS_DB_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_integrations_from_disk() -> None:
+    if not INTEGRATIONS_DB_PATH.exists():
+        return
+    try:
+        payload = json.loads(INTEGRATIONS_DB_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    with INTEGRATIONS_LOCK:
+        for name, record in payload.items():
+            if name not in INTEGRATIONS:
+                continue
+            INTEGRATIONS[name].update(
+                {
+                    "path": record.get("path", INTEGRATIONS[name]["path"]),
+                    "python_cmd": record.get("python_cmd", INTEGRATIONS[name]["python_cmd"]),
+                    "host": record.get("host", INTEGRATIONS[name]["host"]),
+                    "port": int(record.get("port", INTEGRATIONS[name]["port"]) or INTEGRATIONS[name]["port"]),
+                    "status": record.get("status", "idle"),
+                    "message": record.get("message", ""),
+                    "error": record.get("error", ""),
+                    "logs": trim_logs(list(record.get("logs", []))),
+                    "updated_at": record.get("updated_at", ""),
+                    "process": None,
+                    "pid": None,
+                }
+            )
+            if INTEGRATIONS[name]["status"] in {"running", "starting", "stopping"}:
+                INTEGRATIONS[name]["status"] = "stopped"
+                INTEGRATIONS[name]["message"] = "服务重启后未保留原进程，仅恢复历史配置。"
+
+
+def integration_log(name: str, line: str) -> None:
+    clean = line.rstrip("\n")
+    with INTEGRATIONS_LOCK:
+        item = INTEGRATIONS.get(name)
+        if not item:
+            return
+        item["logs"].append(clean)
+        item["logs"] = trim_logs(item["logs"])
+        item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_integrations_to_disk()
+
+
+def update_integration(name: str, **changes) -> None:
+    with INTEGRATIONS_LOCK:
+        item = INTEGRATIONS.get(name)
+        if not item:
+            return
+        item.update(changes)
+        item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_integrations_to_disk()
+
+
+def integration_url(name: str) -> str:
+    with INTEGRATIONS_LOCK:
+        item = INTEGRATIONS[name]
+        return f"http://{item['host']}:{item['port']}"
+
+
+def is_service_online(url: str) -> bool:
+    try:
+        with urlrequest.urlopen(f"{url}/api/status", timeout=1.2) as resp:
+            return 200 <= resp.status < 500
+    except Exception:
+        try:
+            with urlrequest.urlopen(url, timeout=1.2) as resp:
+                return 200 <= resp.status < 500
+        except Exception:
+            return False
+
+
+def integration_payload(name: str) -> Dict:
+    with INTEGRATIONS_LOCK:
+        item = INTEGRATIONS.get(name)
+        if not item:
+            return {"error": "integration not found"}
+        process = item.get("process")
+        running = bool(process and process.poll() is None)
+        url = f"http://{item['host']}:{item['port']}"
+        online = is_service_online(url)
+        status = item["status"]
+        error_text = item.get("error", "")
+        message_text = item.get("message", "")
+        if online and not running and status in {"idle", "stopped"}:
+            status = "online"
+        if online and not running:
+            status = "online"
+            error_text = ""
+            if not message_text:
+                message_text = "BettaFish 已在线，可直接打开。"
+        if running:
+            status = "running"
+        return {
+            "name": item["name"],
+            "path": item.get("path", ""),
+            "python_cmd": item.get("python_cmd", "python"),
+            "host": item.get("host", "127.0.0.1"),
+            "port": int(item.get("port", 5000) or 5000),
+            "status": status,
+            "message": message_text,
+            "error": error_text,
+            "logs": "\n".join(item.get("logs", [])),
+            "url": url,
+            "online": online,
+            "updated_at": item.get("updated_at", ""),
+            "pid": item.get("pid"),
+        }
+
+
+def _bettafish_log_pump(process: subprocess.Popen, name: str) -> None:
+    assert process.stdout is not None
+    for line in process.stdout:
+        integration_log(name, line)
+    code = process.wait()
+    with INTEGRATIONS_LOCK:
+        item = INTEGRATIONS.get(name)
+        if not item:
+            return
+        item["process"] = None
+        item["pid"] = None
+        if item.get("status") == "stopping":
+            item["status"] = "stopped"
+            item["message"] = "BettaFish 已停止。"
+        elif code == 0:
+            item["status"] = "stopped"
+            item["message"] = "BettaFish 已退出。"
+        else:
+            item["status"] = "error"
+            item["error"] = f"BettaFish 退出码 {code}"
+        item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_integrations_to_disk()
+
+
+def start_bettafish_service() -> Dict:
+    current = integration_payload("bettafish")
+    if current.get("online"):
+        return current
+    with INTEGRATIONS_LOCK:
+        item = INTEGRATIONS["bettafish"]
+        process = item.get("process")
+        if process and process.poll() is None:
+            return integration_payload("bettafish")
+        app_path = Path(item["path"]).expanduser().resolve()
+        python_cmd = item.get("python_cmd", "python")
+        host = item.get("host", "127.0.0.1")
+        port = int(item.get("port", 5000) or 5000)
+    app_file = app_path / "app.py"
+    if not app_file.exists():
+        raise RuntimeError("BettaFish 路径无效，未找到 app.py。")
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["HOST"] = host
+    env["PORT"] = str(port)
+    cmd = shlex.split(python_cmd) + ["app.py"]
+    process = subprocess.Popen(
+        cmd,
+        cwd=app_path,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        start_new_session=True,
+    )
+    update_integration("bettafish", process=process, pid=process.pid, status="starting", error="", message="BettaFish 启动中...")
+    integration_log("bettafish", f"[SYSTEM] Starting BettaFish with command: {' '.join(cmd)}")
+    thread = threading.Thread(target=_bettafish_log_pump, args=(process, "bettafish"), daemon=True)
+    thread.start()
+    return integration_payload("bettafish")
+
+
+def stop_bettafish_service() -> Dict:
+    should_save = False
+    with INTEGRATIONS_LOCK:
+        item = INTEGRATIONS["bettafish"]
+        process = item.get("process")
+        if not process or process.poll() is not None:
+            item["status"] = "stopped"
+            item["message"] = "BettaFish 未在当前控制台中运行。"
+            item["process"] = None
+            item["pid"] = None
+            item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            should_save = True
+        else:
+            item["status"] = "stopping"
+            pid = process.pid
+            item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            should_save = True
+    if should_save:
+        save_integrations_to_disk()
+    if not process or process.poll() is not None:
+        return integration_payload("bettafish")
+    integration_log("bettafish", "[SYSTEM] 正在请求停止 BettaFish ...")
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    return integration_payload("bettafish")
+
+
+def mailer_to_disk_record() -> Dict:
+    with MAILER_LOCK:
+        return {
+            "smtp_host": str(MAILER.get("smtp_host", "")).strip(),
+            "smtp_port": int(MAILER.get("smtp_port", 587) or 587),
+            "smtp_security": str(MAILER.get("smtp_security", "starttls")).strip() or "starttls",
+            "username": str(MAILER.get("username", "")).strip(),
+            "password": str(MAILER.get("password", "")),
+            "sender_email": str(MAILER.get("sender_email", "")).strip(),
+            "sender_name": str(MAILER.get("sender_name", "")).strip(),
+            "updated_at": str(MAILER.get("updated_at", "")),
+        }
+
+
+def save_mailer_to_disk() -> None:
+    MAILER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MAILER_DB_PATH.write_text(json.dumps(mailer_to_disk_record(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_mailer_from_disk() -> None:
+    if not MAILER_DB_PATH.exists():
+        return
+    try:
+        payload = json.loads(MAILER_DB_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    with MAILER_LOCK:
+        MAILER.update(
+            {
+                "smtp_host": str(payload.get("smtp_host", "")).strip(),
+                "smtp_port": int(payload.get("smtp_port", 587) or 587),
+                "smtp_security": str(payload.get("smtp_security", "starttls")).strip() or "starttls",
+                "username": str(payload.get("username", "")).strip(),
+                "password": str(payload.get("password", "")),
+                "sender_email": str(payload.get("sender_email", "")).strip(),
+                "sender_name": str(payload.get("sender_name", "")).strip(),
+                "updated_at": str(payload.get("updated_at", "")),
+            }
+        )
+
+
+def mailer_payload(include_secret: bool = False) -> Dict:
+    with MAILER_LOCK:
+        payload = {
+            "smtp_host": str(MAILER.get("smtp_host", "")).strip(),
+            "smtp_port": int(MAILER.get("smtp_port", 587) or 587),
+            "smtp_security": str(MAILER.get("smtp_security", "starttls")).strip() or "starttls",
+            "username": str(MAILER.get("username", "")).strip(),
+            "sender_email": str(MAILER.get("sender_email", "")).strip(),
+            "sender_name": str(MAILER.get("sender_name", "")).strip(),
+            "updated_at": str(MAILER.get("updated_at", "")),
+            "has_password": bool(MAILER.get("password")),
+        }
+        if include_secret:
+            payload["password"] = str(MAILER.get("password", ""))
+        return payload
+
+
+def update_mailer(payload: Dict) -> Dict:
+    smtp_host = str(payload.get("smtp_host", "")).strip()
+    username = str(payload.get("username", "")).strip()
+    sender_email = str(payload.get("sender_email", "")).strip()
+    sender_name = str(payload.get("sender_name", "")).strip()
+    smtp_security = str(payload.get("smtp_security", "starttls")).strip().lower() or "starttls"
+    raw_port = str(payload.get("smtp_port", "587")).strip() or "587"
+    if smtp_security not in {"starttls", "ssl", "none"}:
+        raise ValueError("SMTP 加密方式只支持 starttls / ssl / none。")
+    try:
+        smtp_port = int(raw_port)
+    except ValueError as exc:
+        raise ValueError("SMTP 端口必须是整数。") from exc
+    password_in_payload = "password" in payload
+    password = str(payload.get("password", "")) if password_in_payload else None
+    with MAILER_LOCK:
+        MAILER["smtp_host"] = smtp_host
+        MAILER["smtp_port"] = smtp_port
+        MAILER["smtp_security"] = smtp_security
+        MAILER["username"] = username
+        MAILER["sender_email"] = sender_email
+        MAILER["sender_name"] = sender_name
+        if password is not None and password != "":
+            MAILER["password"] = password
+        elif password == "":
+            MAILER["password"] = MAILER.get("password", "")
+        MAILER["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_mailer_to_disk()
+    return mailer_payload()
+
+
+def parse_recipients(raw_text: str) -> List[str]:
+    seen = set()
+    recipients: List[str] = []
+    parts = re.split(r"[\s,;，；]+", raw_text.strip())
+    for part in parts:
+        email = part.strip()
+        if not email:
+            continue
+        if not EMAIL_RE.match(email):
+            raise ValueError(f"邮箱格式不合法: {email}")
+        lowered = email.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        recipients.append(email)
+    return recipients
+
+
+def run_report_files(run_dir: Path) -> List[Dict]:
+    files = [
+        ("价值排序页", run_dir / "usefulness_ranking.html"),
+        ("深度文章页", run_dir / "article.html"),
+        ("摘要页", run_dir / "summary.html"),
+        ("评分 JSON", run_dir / "usefulness_ranking.json"),
+        ("结果 JSON", run_dir / "results.json"),
+        ("结果 CSV", run_dir / "results.csv"),
+        ("摘要 Markdown", run_dir / "summary.md"),
+        ("详细报告", run_dir / "detailed_report.html"),
+        ("详细报告 Markdown", run_dir / "detailed_report.md"),
+    ]
+    items: List[Dict] = []
+    for label, path in files:
+        if path.exists():
+            rel = path.relative_to(BASE_DIR).as_posix()
+            items.append(
+                {
+                    "label": label,
+                    "name": path.name,
+                    "path": str(path),
+                    "relpath": rel,
+                    "url": f"/files/{rel}",
+                }
+            )
+    return items
+
+
+def resolve_run_dir(run_name: str) -> Path:
+    clean_name = (run_name or "").strip()
+    if not clean_name:
+        raise ValueError("请选择要发送的输出目录。")
+    target = (OUTPUT_DIR / clean_name).resolve()
+    if OUTPUT_DIR not in target.parents:
+        raise ValueError("输出目录路径非法。")
+    if not target.exists() or not target.is_dir():
+        raise ValueError("输出目录不存在。")
+    return target
+
+
+def build_mail_html(body: str, run_name: str, attachment_names: List[str]) -> str:
+    safe_body = "<br>".join(
+        line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        for line in body.splitlines()
+    )
+    attachment_html = "".join(
+        f"<li>{name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')}</li>"
+        for name in attachment_names
+    )
+    return (
+        "<html><body style=\"font-family:Arial,'PingFang SC',sans-serif;color:#1f2937;line-height:1.7;\">"
+        f"<div>{safe_body or ' '}</div>"
+        f"<hr style=\"border:none;border-top:1px solid #e5e7eb;margin:20px 0;\">"
+        f"<p style=\"margin:0 0 8px;color:#6b7280;\">来自本地控制台的批量邮件投递</p>"
+        f"<p style=\"margin:0 0 8px;\"><strong>输出目录：</strong>{run_name}</p>"
+        f"<p style=\"margin:0 0 8px;\"><strong>附件数量：</strong>{len(attachment_names)}</p>"
+        f"<ul style=\"margin:8px 0 0 20px;\">{attachment_html}</ul>"
+        "</body></html>"
+    )
+
+
+def send_one_email(
+    smtp_settings: Dict,
+    recipient: str,
+    subject: str,
+    body: str,
+    run_name: str,
+    attachments: List[Path],
+) -> None:
+    msg = EmailMessage()
+    sender_email = smtp_settings["sender_email"]
+    sender_name = smtp_settings.get("sender_name", "")
+    msg["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
+    msg["To"] = recipient
+    msg["Subject"] = subject
+    msg.set_content(body or " ")
+    msg.add_alternative(build_mail_html(body, run_name, [path.name for path in attachments]), subtype="html")
+
+    for attachment in attachments:
+        mime_type, _ = mimetypes.guess_type(attachment.name)
+        maintype, subtype = ("application", "octet-stream")
+        if mime_type and "/" in mime_type:
+            maintype, subtype = mime_type.split("/", 1)
+        msg.add_attachment(
+            attachment.read_bytes(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment.name,
+        )
+
+    context = ssl.create_default_context()
+    security = smtp_settings["smtp_security"]
+    host = smtp_settings["smtp_host"]
+    port = smtp_settings["smtp_port"]
+    username = smtp_settings["username"]
+    password = smtp_settings["password"]
+    if security == "ssl":
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=30) as server:
+            if username:
+                server.login(username, password)
+            server.send_message(msg)
+        return
+
+    with smtplib.SMTP(host, port, timeout=30) as server:
+        server.ehlo()
+        if security == "starttls":
+            server.starttls(context=context)
+            server.ehlo()
+        if username:
+            server.login(username, password)
+        server.send_message(msg)
+
+
+def run_email_job(task_id: str, params: Dict) -> None:
+    with MAILER_LOCK:
+        smtp_settings = {
+            "smtp_host": str(MAILER.get("smtp_host", "")).strip(),
+            "smtp_port": int(MAILER.get("smtp_port", 587) or 587),
+            "smtp_security": str(MAILER.get("smtp_security", "starttls")).strip() or "starttls",
+            "username": str(MAILER.get("username", "")).strip(),
+            "password": str(MAILER.get("password", "")),
+            "sender_email": str(MAILER.get("sender_email", "")).strip(),
+            "sender_name": str(MAILER.get("sender_name", "")).strip(),
+        }
+    required = {
+        "smtp_host": "SMTP Host",
+        "sender_email": "发件邮箱",
+    }
+    for key, label in required.items():
+        if not smtp_settings.get(key):
+            raise ValueError(f"{label} 未配置。")
+    if smtp_settings["username"] and not smtp_settings["password"]:
+        raise ValueError("已填写 SMTP 用户名，但密码为空。")
+
+    recipients = parse_recipients(str(params.get("recipients", "")))
+    if not recipients:
+        raise ValueError("请至少填写一个收件邮箱。")
+    subject = str(params.get("subject", "")).strip()
+    if not subject:
+        raise ValueError("邮件标题不能为空。")
+    body = str(params.get("body", "")).strip()
+    run_dir = resolve_run_dir(str(params.get("run_name", "")))
+    all_files = {item["name"]: Path(item["path"]) for item in run_report_files(run_dir)}
+    selected_names = [str(item).strip() for item in params.get("attachments", []) if str(item).strip()]
+    if not selected_names:
+        raise ValueError("请至少选择一个附件。")
+    attachments: List[Path] = []
+    for name in selected_names:
+        if name not in all_files:
+            raise ValueError(f"未找到附件: {name}")
+        attachments.append(all_files[name])
+
+    update_task(task_id, stage="正在连接 SMTP", progress=8, result_dir=str(run_dir))
+    append_log(task_id, f"[SYSTEM] 目标收件人数: {len(recipients)}")
+    append_log(task_id, f"[SYSTEM] 发送目录: {run_dir.name}")
+    append_log(task_id, f"[SYSTEM] 附件: {', '.join(path.name for path in attachments)}")
+    failures: List[str] = []
+    total = len(recipients)
+    for index, recipient in enumerate(recipients, start=1):
+        with TASKS_LOCK:
+            task = TASKS.get(task_id)
+            cancelled = bool(task and task.get("cancel_requested"))
+        if cancelled:
+            raise RuntimeError("邮件任务已停止。")
+        update_task(task_id, stage=f"正在发送第 {index}/{total} 封", progress=min(96, 12 + int(index / total * 80)))
+        append_log(task_id, f"[SEND] {recipient}")
+        try:
+            send_one_email(smtp_settings, recipient, subject, body, run_dir.name, attachments)
+            append_log(task_id, f"[OK] {recipient}")
+        except Exception as exc:
+            failures.append(f"{recipient}: {exc}")
+            append_log(task_id, f"[ERROR] {recipient}: {exc}")
+    if failures:
+        raise RuntimeError("部分邮件发送失败。\n" + "\n".join(failures))
+    update_task(
+        task_id,
+        message=f"已成功发送 {total} 封邮件。",
+        stage="已完成",
+        progress=100,
+        result_dir=str(run_dir),
+    )
+
+
 def list_run_dirs(limit: int = 12) -> List[Path]:
     if not OUTPUT_DIR.exists():
         return []
@@ -112,20 +666,7 @@ def list_run_dirs(limit: int = 12) -> List[Path]:
 
 
 def resolve_report_links(run_dir: Path) -> List[Tuple[str, str]]:
-    files = [
-        ("价值排序页", run_dir / "usefulness_ranking.html"),
-        ("深度文章页", run_dir / "article.html"),
-        ("摘要页", run_dir / "summary.html"),
-        ("评分 JSON", run_dir / "usefulness_ranking.json"),
-        ("结果 JSON", run_dir / "results.json"),
-        ("结果 CSV", run_dir / "results.csv"),
-    ]
-    links: List[Tuple[str, str]] = []
-    for label, path in files:
-        if path.exists():
-            rel = path.relative_to(BASE_DIR).as_posix()
-            links.append((label, f"/files/{rel}"))
-    return links
+    return [(item["label"], item["url"]) for item in run_report_files(run_dir)]
 
 
 def detect_newest_dir(before: set[str]) -> Path | None:
@@ -140,11 +681,13 @@ def detect_newest_dir(before: set[str]) -> Path | None:
 def recent_runs_payload() -> List[Dict]:
     payload = []
     for run_dir in list_run_dirs():
+        files = run_report_files(run_dir)
         payload.append(
             {
                 "name": run_dir.name,
                 "updated_at": datetime.fromtimestamp(run_dir.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                "links": [{"label": label, "url": url} for label, url in resolve_report_links(run_dir)],
+                "links": [{"label": item["label"], "url": item["url"]} for item in files],
+                "files": [{"label": item["label"], "name": item["name"]} for item in files],
             }
         )
     return payload
@@ -438,8 +981,10 @@ def worker(task_id: str) -> None:
         params = task["params"]
         if task["type"] == "keyword":
             run_keyword_job(task_id, params["keyword"], params["lang"], params["state"], params["headless"])
-        else:
+        elif task["type"] == "following":
             run_following_job(task_id, params["state"], params["headless"])
+        else:
+            run_email_job(task_id, params)
         with TASKS_LOCK:
             task = TASKS.get(task_id)
             cancelled = bool(task and task.get("cancel_requested"))
@@ -531,8 +1076,9 @@ def render_page() -> str:
     }
     .panel h2 { margin: 0 0 12px; font-size: 1.15rem; }
     .panel p { margin: 0 0 14px; color: var(--muted); line-height: 1.7; }
+    .panel h3 { margin: 14px 0 8px; font-size: 0.98rem; }
     label { display: block; margin-bottom: 12px; font-size: 0.95rem; }
-    input[type="text"] {
+    input[type="text"], input[type="password"], select, textarea {
       width: 100%;
       margin-top: 6px;
       padding: 12px 14px;
@@ -540,6 +1086,12 @@ def render_page() -> str:
       border: 1px solid #d6ccbb;
       background: rgba(255,255,255,0.9);
       font-size: 0.96rem;
+      color: var(--ink);
+      font-family: inherit;
+    }
+    textarea {
+      min-height: 108px;
+      resize: vertical;
     }
     .checkbox { display: flex; align-items: center; gap: 10px; margin: 12px 0 16px; }
     .btn {
@@ -734,10 +1286,83 @@ def render_page() -> str:
       background: linear-gradient(90deg, #b74834, #d6694c);
       box-shadow: 0 10px 24px rgba(183,72,52,0.22);
     }
+    .service-box {
+      border: 1px solid #ddd3c6;
+      border-radius: 18px;
+      padding: 16px;
+      background: rgba(255,255,255,0.68);
+    }
+    .service-facts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 10px 0 12px;
+    }
+    .service-chip {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid #d8d0c2;
+      background: rgba(255,255,255,0.9);
+      font-size: 0.86rem;
+      color: var(--ink);
+    }
+    .service-log {
+      max-height: 220px;
+      min-height: 160px;
+      margin-top: 10px;
+    }
+    .mail-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .mail-grid.full {
+      grid-template-columns: 1fr;
+    }
+    .selection-box {
+      border: 1px solid #ddd3c6;
+      border-radius: 18px;
+      padding: 14px;
+      background: rgba(255,255,255,0.72);
+    }
+    .selection-box strong {
+      display: block;
+      margin-bottom: 8px;
+    }
+    .option-list {
+      display: grid;
+      gap: 8px;
+      max-height: 180px;
+      overflow: auto;
+      margin-top: 8px;
+    }
+    .option-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.86);
+      border: 1px solid #e0d8cb;
+    }
+    .option-item input {
+      margin-top: 2px;
+    }
+    .option-item small {
+      display: block;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .mini-note {
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.6;
+    }
     @media (max-width: 980px) {
       .layout { grid-template-columns: 1fr; }
       .dual { grid-template-columns: 1fr; }
       .status-shell { min-height: 0; }
+      .mail-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -781,6 +1406,98 @@ def render_page() -> str:
           </label>
           <button class="btn alt" type="submit">开始抓取关注流</button>
         </form>
+
+        <section class="panel">
+          <h2>一键批量发邮件</h2>
+          <p>把已生成的报告作为附件，按收件人列表逐封发送。适合把结果直接推给客户、团队或订阅用户。</p>
+          <div class="mail-grid">
+            <label>SMTP Host
+              <input type="text" id="smtpHost" placeholder="smtp.qq.com / smtp.gmail.com" />
+            </label>
+            <label>SMTP Port
+              <input type="text" id="smtpPort" placeholder="587" />
+            </label>
+            <label>加密方式
+              <select id="smtpSecurity">
+                <option value="starttls">STARTTLS</option>
+                <option value="ssl">SSL</option>
+                <option value="none">无加密</option>
+              </select>
+            </label>
+            <label>SMTP 用户名
+              <input type="text" id="smtpUsername" placeholder="通常是邮箱地址" />
+            </label>
+            <label>SMTP 密码 / 授权码
+              <input type="password" id="smtpPassword" placeholder="留空则保留已保存密码" />
+            </label>
+            <label>发件邮箱
+              <input type="text" id="senderEmail" placeholder="noreply@example.com" />
+            </label>
+          </div>
+          <div class="mail-grid" style="margin-top: 8px;">
+            <label>发件人名称
+              <input type="text" id="senderName" placeholder="X Search Aggregator" />
+            </label>
+            <label>发送标题
+              <input type="text" id="emailSubject" placeholder="本周 X 情报简报" />
+            </label>
+          </div>
+          <label>收件人列表
+            <textarea id="emailRecipients" placeholder="支持逗号、空格或换行分隔，例如&#10;a@example.com&#10;b@example.com"></textarea>
+          </label>
+          <label>正文
+            <textarea id="emailBody" placeholder="这里填写邮件正文。系统会自动附带输出目录和附件列表说明。"></textarea>
+          </label>
+          <div class="mail-grid full">
+            <label>选择输出目录
+              <select id="runSelect"></select>
+            </label>
+          </div>
+          <div class="selection-box">
+            <strong>要发送的附件</strong>
+            <div class="mini-note" id="attachmentHint">先选择一个输出目录。</div>
+            <div class="option-list" id="attachmentList"></div>
+          </div>
+          <div class="toolbar">
+            <button class="btn ghost" id="saveMailerBtn" type="button">保存 SMTP 配置</button>
+            <button class="btn alt" id="sendEmailBtn" type="button">一键批量发送</button>
+          </div>
+          <div id="mailerMessage"></div>
+          <div class="mini-note">SMTP 配置会保存在本地 `output/.web_mailer.json`。密码输入留空时，不会覆盖已保存值。</div>
+        </section>
+
+        <section class="panel">
+          <h2>BettaFish 集成</h2>
+          <p>接入官方 BettaFish 多 Agent 舆情系统。这里负责管理它的本地路径、启动状态和访问入口，不重写它本身的分析逻辑。</p>
+          <label>BettaFish 本地路径
+            <input type="text" id="bettafishPath" placeholder="/path/to/BettaFish" />
+          </label>
+          <label>Python 命令
+            <input type="text" id="bettafishPython" placeholder="python" />
+          </label>
+          <label>Host
+            <input type="text" id="bettafishHost" placeholder="127.0.0.1" />
+          </label>
+          <label>Port
+            <input type="text" id="bettafishPort" placeholder="5000" />
+          </label>
+          <div class="toolbar">
+            <button class="btn ghost" id="saveBettafishBtn" type="button">保存配置</button>
+            <button class="btn" id="startBettafishBtn" type="button">启动 BettaFish</button>
+            <button class="btn stop" id="stopBettafishBtn" type="button">停止 BettaFish</button>
+            <a class="btn alt" id="openBettafishBtn" href="#" target="_blank" rel="noopener">打开 BettaFish</a>
+          </div>
+          <div class="service-box" style="margin-top: 14px;">
+            <div class="task-card-top">
+              <div class="task-card-title">服务状态</div>
+              <div class="badge" id="bettafishBadge">idle</div>
+            </div>
+            <div class="task-card-meta" id="bettafishMeta">尚未配置 BettaFish 路径。</div>
+            <div class="service-facts" id="bettafishFacts"></div>
+            <div id="bettafishMessage"></div>
+            <pre class="service-log" id="bettafishLogs">暂无 BettaFish 日志。</pre>
+          </div>
+        </section>
 
         <section class="panel">
           <h2>最近生成的结果</h2>
@@ -840,9 +1557,40 @@ def render_page() -> str:
     const taskListEl = document.getElementById("taskList");
     const refreshTasksBtn = document.getElementById("refreshTasksBtn");
     const stopTaskBtn = document.getElementById("stopTaskBtn");
+    const bettafishPathEl = document.getElementById("bettafishPath");
+    const bettafishPythonEl = document.getElementById("bettafishPython");
+    const bettafishHostEl = document.getElementById("bettafishHost");
+    const bettafishPortEl = document.getElementById("bettafishPort");
+    const saveBettafishBtn = document.getElementById("saveBettafishBtn");
+    const startBettafishBtn = document.getElementById("startBettafishBtn");
+    const stopBettafishBtn = document.getElementById("stopBettafishBtn");
+    const openBettafishBtn = document.getElementById("openBettafishBtn");
+    const bettafishBadgeEl = document.getElementById("bettafishBadge");
+    const bettafishMetaEl = document.getElementById("bettafishMeta");
+    const bettafishFactsEl = document.getElementById("bettafishFacts");
+    const bettafishMessageEl = document.getElementById("bettafishMessage");
+    const bettafishLogsEl = document.getElementById("bettafishLogs");
+    const smtpHostEl = document.getElementById("smtpHost");
+    const smtpPortEl = document.getElementById("smtpPort");
+    const smtpSecurityEl = document.getElementById("smtpSecurity");
+    const smtpUsernameEl = document.getElementById("smtpUsername");
+    const smtpPasswordEl = document.getElementById("smtpPassword");
+    const senderEmailEl = document.getElementById("senderEmail");
+    const senderNameEl = document.getElementById("senderName");
+    const emailSubjectEl = document.getElementById("emailSubject");
+    const emailRecipientsEl = document.getElementById("emailRecipients");
+    const emailBodyEl = document.getElementById("emailBody");
+    const runSelectEl = document.getElementById("runSelect");
+    const attachmentListEl = document.getElementById("attachmentList");
+    const attachmentHintEl = document.getElementById("attachmentHint");
+    const mailerMessageEl = document.getElementById("mailerMessage");
+    const saveMailerBtn = document.getElementById("saveMailerBtn");
+    const sendEmailBtn = document.getElementById("sendEmailBtn");
 
     let currentTaskId = null;
     let timerId = null;
+    let integrationTimerId = null;
+    let recentRuns = [];
 
     function buildFacts(task) {
       const facts = [];
@@ -869,11 +1617,106 @@ def render_page() -> str:
       }[ch]));
     }
 
-    function renderRecentRuns(items) {
-      if (!items.length) {
-        recentRunsEl.innerHTML = '<span class="muted">当前还没有输出目录。</span>';
+    function renderBettafish(data) {
+      bettafishPathEl.value = data.path || "";
+      bettafishPythonEl.value = data.python_cmd || "python";
+      bettafishHostEl.value = data.host || "127.0.0.1";
+      bettafishPortEl.value = data.port || 5000;
+      bettafishBadgeEl.textContent = data.status || "idle";
+      bettafishMetaEl.textContent = `地址 ${data.url || "-"} · 更新于 ${data.updated_at || "-"}`;
+      openBettafishBtn.href = data.url || "#";
+      openBettafishBtn.style.pointerEvents = data.url ? "auto" : "none";
+      openBettafishBtn.style.opacity = data.url ? "1" : "0.5";
+      const facts = [
+        `在线检测: ${data.online ? "online" : "offline"}`,
+        `PID: ${data.pid || "-"}`,
+        `Host: ${data.host || "-"}`,
+        `Port: ${data.port || "-"}`,
+      ];
+      bettafishFactsEl.innerHTML = facts.map((fact) => `<span class="service-chip">${escapeHtml(fact)}</span>`).join("");
+      let messageHtml = "";
+      if (data.error) {
+        messageHtml = `<div class="message error">${escapeHtml(data.error)}</div>`;
+      } else if (data.message) {
+        messageHtml = `<div class="message">${escapeHtml(data.message)}</div>`;
+      }
+      bettafishMessageEl.innerHTML = messageHtml;
+      bettafishLogsEl.textContent = data.logs || "暂无 BettaFish 日志。";
+      bettafishLogsEl.scrollTop = bettafishLogsEl.scrollHeight;
+      startBettafishBtn.disabled = ["starting", "running"].includes(data.status);
+      stopBettafishBtn.disabled = !["starting", "running", "online", "stopping"].includes(data.status);
+    }
+
+    async function refreshBettafish() {
+      const res = await fetch("/api/integrations/bettafish");
+      const data = await res.json();
+      renderBettafish(data);
+    }
+
+    function selectedAttachments() {
+      return Array.from(document.querySelectorAll(".js-attachment:checked")).map((item) => item.value);
+    }
+
+    function renderAttachmentOptions() {
+      const selectedRun = recentRuns.find((item) => item.name === runSelectEl.value);
+      if (!selectedRun) {
+        attachmentHintEl.textContent = "先选择一个输出目录。";
+        attachmentListEl.innerHTML = "";
         return;
       }
+      const files = selectedRun.files || [];
+      if (!files.length) {
+        attachmentHintEl.textContent = "这个目录下没有可发送的标准结果文件。";
+        attachmentListEl.innerHTML = "";
+        return;
+      }
+      attachmentHintEl.textContent = `当前目录 ${selectedRun.name}，默认全选 ${files.length} 个附件。`;
+      attachmentListEl.innerHTML = files.map((file) => `
+        <label class="option-item">
+          <input class="js-attachment" type="checkbox" value="${escapeHtml(file.name)}" checked />
+          <span>
+            <strong>${escapeHtml(file.label)}</strong>
+            <small>${escapeHtml(file.name)}</small>
+          </span>
+        </label>
+      `).join("");
+    }
+
+    function renderMailerConfig(data) {
+      smtpHostEl.value = data.smtp_host || "";
+      smtpPortEl.value = data.smtp_port || 587;
+      smtpSecurityEl.value = data.smtp_security || "starttls";
+      smtpUsernameEl.value = data.username || "";
+      senderEmailEl.value = data.sender_email || "";
+      senderNameEl.value = data.sender_name || "";
+      smtpPasswordEl.value = "";
+      let html = "";
+      if (data.updated_at) {
+        const passwordStatus = data.has_password ? "已保存密码" : "未保存密码";
+        html = `<div class="message">SMTP 配置已加载。${escapeHtml(passwordStatus)}，更新时间 ${escapeHtml(data.updated_at)}。</div>`;
+      }
+      mailerMessageEl.innerHTML = html;
+    }
+
+    async function refreshMailerConfig() {
+      const res = await fetch("/api/mailer/config");
+      const data = await res.json();
+      renderMailerConfig(data);
+    }
+
+    function renderRecentRuns(items) {
+      recentRuns = items;
+      if (!items.length) {
+        recentRunsEl.innerHTML = '<span class="muted">当前还没有输出目录。</span>';
+        runSelectEl.innerHTML = '<option value="">暂无输出目录</option>';
+        renderAttachmentOptions();
+        return;
+      }
+      const current = runSelectEl.value;
+      runSelectEl.innerHTML = items.map((item) => `<option value="${escapeHtml(item.name)}">${escapeHtml(item.name)} · ${escapeHtml(item.updated_at)}</option>`).join("");
+      const hasCurrent = items.some((item) => item.name === current);
+      runSelectEl.value = hasCurrent ? current : items[0].name;
+      renderAttachmentOptions();
       recentRunsEl.innerHTML = items.map((item) => `
         <article class="run-card">
           <div class="run-title">${escapeHtml(item.name)}</div>
@@ -1024,6 +1867,108 @@ def render_page() -> str:
       }
     }
 
+    async function saveMailerConfig() {
+      const payload = {
+        smtp_host: smtpHostEl.value.trim(),
+        smtp_port: smtpPortEl.value.trim(),
+        smtp_security: smtpSecurityEl.value,
+        username: smtpUsernameEl.value.trim(),
+        password: smtpPasswordEl.value,
+        sender_email: senderEmailEl.value.trim(),
+        sender_name: senderNameEl.value.trim(),
+      };
+      const res = await fetch("/api/mailer/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "保存 SMTP 配置失败");
+      }
+      renderMailerConfig(data);
+    }
+
+    async function submitEmailTask() {
+      sendEmailBtn.disabled = true;
+      try {
+        await saveMailerConfig();
+        const payload = {
+          recipients: emailRecipientsEl.value,
+          subject: emailSubjectEl.value.trim(),
+          body: emailBodyEl.value,
+          run_name: runSelectEl.value,
+          attachments: selectedAttachments(),
+        };
+        const res = await fetch("/api/tasks/email", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "创建邮件任务失败");
+        }
+        currentTaskId = data.task_id;
+        if (timerId) {
+          clearInterval(timerId);
+        }
+        mailerMessageEl.innerHTML = `<div class="message">邮件任务已提交，正在批量发送。</div>`;
+        await pollTask(currentTaskId);
+        timerId = setInterval(() => pollTask(currentTaskId), 2000);
+      } catch (err) {
+        mailerMessageEl.innerHTML = `<div class="message error">${escapeHtml(err.message || err)}</div>`;
+      } finally {
+        sendEmailBtn.disabled = false;
+      }
+    }
+
+    async function saveBettafishConfig() {
+      const payload = {
+        path: bettafishPathEl.value.trim(),
+        python_cmd: bettafishPythonEl.value.trim(),
+        host: bettafishHostEl.value.trim(),
+        port: bettafishPortEl.value.trim(),
+      };
+      const res = await fetch("/api/integrations/bettafish/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "保存 BettaFish 配置失败");
+      }
+      renderBettafish(data);
+    }
+
+    async function startBettafish() {
+      try {
+        await saveBettafishConfig();
+        const res = await fetch("/api/integrations/bettafish/start", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "启动 BettaFish 失败");
+        }
+        renderBettafish(data);
+      } catch (err) {
+        bettafishMessageEl.innerHTML = `<div class="message error">${escapeHtml(err.message || err)}</div>`;
+      }
+    }
+
+    async function stopBettafish() {
+      try {
+        const res = await fetch("/api/integrations/bettafish/stop", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "停止 BettaFish 失败");
+        }
+        renderBettafish(data);
+      } catch (err) {
+        bettafishMessageEl.innerHTML = `<div class="message error">${escapeHtml(err.message || err)}</div>`;
+      }
+    }
+
     document.querySelectorAll(".js-task-form").forEach((form) => {
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -1032,9 +1977,30 @@ def render_page() -> str:
     });
     refreshTasksBtn.addEventListener("click", refreshTaskList);
     stopTaskBtn.addEventListener("click", stopCurrentTask);
+    runSelectEl.addEventListener("change", renderAttachmentOptions);
+    saveMailerBtn.addEventListener("click", async () => {
+      try {
+        await saveMailerConfig();
+      } catch (err) {
+        mailerMessageEl.innerHTML = `<div class="message error">${escapeHtml(err.message || err)}</div>`;
+      }
+    });
+    sendEmailBtn.addEventListener("click", submitEmailTask);
+    saveBettafishBtn.addEventListener("click", async () => {
+      try {
+        await saveBettafishConfig();
+      } catch (err) {
+        bettafishMessageEl.innerHTML = `<div class="message error">${escapeHtml(err.message || err)}</div>`;
+      }
+    });
+    startBettafishBtn.addEventListener("click", startBettafish);
+    stopBettafishBtn.addEventListener("click", stopBettafish);
 
     refreshRecentRuns();
     refreshTaskList();
+    refreshMailerConfig();
+    refreshBettafish();
+    integrationTimerId = setInterval(refreshBettafish, 3000);
     setIdleView();
   </script>
 </body>
@@ -1049,6 +2015,62 @@ def index() -> str:
 @app.get("/api/runs")
 def api_runs():
     return jsonify({"runs": recent_runs_payload()})
+
+
+@app.get("/api/mailer/config")
+def api_mailer_config():
+    return jsonify(mailer_payload())
+
+
+@app.post("/api/mailer/config")
+def api_mailer_config_save():
+    payload = request.get_json(silent=True) or {}
+    try:
+        return jsonify(update_mailer(payload))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/integrations/bettafish")
+def api_bettafish():
+    return jsonify(integration_payload("bettafish"))
+
+
+@app.post("/api/integrations/bettafish/config")
+def api_bettafish_config():
+    payload = request.get_json(silent=True) or {}
+    path = str(payload.get("path", "")).strip()
+    python_cmd = str(payload.get("python_cmd", "python")).strip() or "python"
+    host = str(payload.get("host", "127.0.0.1")).strip() or "127.0.0.1"
+    raw_port = str(payload.get("port", "5000")).strip() or "5000"
+    try:
+        port = int(raw_port)
+    except ValueError:
+        return jsonify({"error": "BettaFish 端口必须是整数。"}), 400
+    update_integration(
+        "bettafish",
+        path=path,
+        python_cmd=python_cmd,
+        host=host,
+        port=port,
+        message="BettaFish 配置已保存。",
+        error="",
+    )
+    return jsonify(integration_payload("bettafish"))
+
+
+@app.post("/api/integrations/bettafish/start")
+def api_bettafish_start():
+    try:
+        return jsonify(start_bettafish_service())
+    except Exception as exc:
+        update_integration("bettafish", status="error", error=str(exc), message="")
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/integrations/bettafish/stop")
+def api_bettafish_stop():
+    return jsonify(stop_bettafish_service())
 
 
 @app.get("/api/tasks")
@@ -1085,6 +2107,22 @@ def api_task_following():
     return jsonify({"task_id": task_id})
 
 
+@app.post("/api/tasks/email")
+def api_task_email():
+    payload = request.get_json(silent=True) or {}
+    task_id = start_task(
+        "email",
+        {
+            "recipients": str(payload.get("recipients", "")),
+            "subject": str(payload.get("subject", "")).strip(),
+            "body": str(payload.get("body", "")),
+            "run_name": str(payload.get("run_name", "")).strip(),
+            "attachments": list(payload.get("attachments", [])),
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
 @app.get("/api/tasks/<task_id>")
 def api_task_status(task_id: str):
     payload = task_payload(task_id)
@@ -1115,4 +2153,8 @@ def serve_file(relpath: str):
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(exist_ok=True)
     load_tasks_from_disk()
-    app.run(host="127.0.0.1", port=8080, debug=False, threaded=True)
+    load_integrations_from_disk()
+    load_mailer_from_disk()
+    host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = int(os.environ.get("PORT", "8080").strip() or "8080")
+    app.run(host=host, port=port, debug=False, threaded=True)

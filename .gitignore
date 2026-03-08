@@ -8,3 +8,4 @@ output/
 .DS_Store
 .pw_profile/
 chrome_profile*/
+integrations/
