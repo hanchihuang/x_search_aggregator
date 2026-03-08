@@ -34,6 +34,8 @@ MAILER_DB_PATH = BASE_DIR / "output" / ".web_mailer.json"
 DEFAULT_STATE = "auth_state_cookie.json"
 LOG_LIMIT = 1200
 SCROLL_RE = re.compile(r"(?:滚动|Scroll)\s+(\d+)(?:/(\d+))?.*?共\s+(\d+)\s*条", re.IGNORECASE)
+SCROLL_EN_RE = re.compile(r"Scroll\s+(\d+)(?:/(\d+))?:\s*\+\s*(\d+)\s+new,\s+total\s+(\d+)", re.IGNORECASE)
+PAGE_EN_RE = re.compile(r"Page\s+(\d+)(?:/(\d+))?:\s*\+\s*(\d+)\s+new,\s+total\s+(\d+)", re.IGNORECASE)
 TARGET_RE = re.compile(r"目标:\s*收集前\s*(\d+)\s*条")
 SUCCESS_RE = re.compile(r"成功收集\s+(\d+)\s+条推文(?:（目标:\s*(\d+)条）)?")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -735,6 +737,32 @@ def infer_progress(task: Dict, line: str) -> None:
         else:
             task["progress"] = min(78, max(task["progress"], 12 + current_scroll))
 
+    scroll_en_match = SCROLL_EN_RE.search(line)
+    if scroll_en_match:
+        current_scroll = int(scroll_en_match.group(1))
+        max_scrolls = int(scroll_en_match.group(2) or 0)
+        new_items = int(scroll_en_match.group(3))
+        collected = int(scroll_en_match.group(4))
+        task["current_scroll"] = current_scroll
+        task["max_scrolls"] = max_scrolls
+        task["collected_items"] = collected
+        task["last_new_items"] = new_items
+        task["stage"] = "正在抓取内容"
+        task["progress"] = min(78, max(task["progress"], 12 + current_scroll))
+
+    page_match = PAGE_EN_RE.search(line)
+    if page_match:
+        current_scroll = int(page_match.group(1))
+        max_scrolls = int(page_match.group(2) or 0)
+        new_items = int(page_match.group(3))
+        collected = int(page_match.group(4))
+        task["current_scroll"] = current_scroll
+        task["max_scrolls"] = max_scrolls
+        task["collected_items"] = collected
+        task["last_new_items"] = new_items
+        task["stage"] = "正在抓取列表"
+        task["progress"] = min(78, max(task["progress"], 12 + current_scroll))
+
     success_match = SUCCESS_RE.search(line)
     if success_match:
         task["collected_items"] = int(success_match.group(1))
@@ -973,6 +1001,54 @@ def run_following_job(task_id: str, state: str, headless: bool) -> None:
     )
 
 
+def run_user_timeline_job(task_id: str, user_url: str, state: str, headless: bool) -> None:
+    before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
+    cmd = [sys.executable, "crawl_user_timeline.py", "--user-url", user_url, "--state", state, "--max-items", "0"]
+    if headless:
+        cmd.append("--headless")
+    code = run_command_stream(task_id, cmd, "正在抓取博主历史推文", 5)
+    if code != 0:
+        raise RuntimeError("博主历史推文抓取失败，请检查日志。")
+
+    run_dir = detect_newest_dir(before)
+    if run_dir is None:
+        raise RuntimeError("历史推文抓取完成，但未找到输出目录。")
+
+    update_task(task_id, result_dir=str(run_dir), stage="正在生成排序 HTML", progress=86)
+    code = run_command_stream(task_id, [sys.executable, "rank_usefulness.py", "--input", str(run_dir)], "正在生成排序 HTML", 88)
+    if code != 0:
+        raise RuntimeError("历史推文评分失败，请检查日志。")
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"博主历史推文抓取完成：{user_url}",
+        stage="已完成",
+        progress=100,
+    )
+
+
+def run_user_following_job(task_id: str, user_url: str, state: str, headless: bool) -> None:
+    before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
+    cmd = [sys.executable, "crawl_user_following.py", "--user-url", user_url, "--state", state, "--max-items", "0"]
+    if headless:
+        cmd.append("--headless")
+    code = run_command_stream(task_id, cmd, "正在抓取博主关注列表", 5)
+    if code != 0:
+        raise RuntimeError("博主关注列表抓取失败，请检查日志。")
+
+    run_dir = detect_newest_dir(before)
+    if run_dir is None:
+        raise RuntimeError("关注列表抓取完成，但未找到输出目录。")
+
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"博主关注列表抓取完成：{user_url}",
+        stage="已完成",
+        progress=100,
+    )
+
+
 def worker(task_id: str) -> None:
     update_task(task_id, status="running", stage="准备启动", progress=2)
     try:
@@ -983,6 +1059,10 @@ def worker(task_id: str) -> None:
             run_keyword_job(task_id, params["keyword"], params["lang"], params["state"], params["headless"])
         elif task["type"] == "following":
             run_following_job(task_id, params["state"], params["headless"])
+        elif task["type"] == "user_timeline":
+            run_user_timeline_job(task_id, params["user_url"], params["state"], params["headless"])
+        elif task["type"] == "user_following":
+            run_user_following_job(task_id, params["user_url"], params["state"], params["headless"])
         else:
             run_email_job(task_id, params)
         with TASKS_LOCK:
@@ -1407,6 +1487,38 @@ def render_page() -> str:
           <button class="btn alt" type="submit">开始抓取关注流</button>
         </form>
 
+        <form class="panel js-task-form" data-kind="user_timeline">
+          <h2>抓取某个博主全部历史推文</h2>
+          <p>输入 `x.com` 用户主页，抓取该博主尽可能完整的历史推文，并生成文章页、详细报告和价值排序页。</p>
+          <label>用户主页
+            <input type="text" name="user_url" placeholder="https://x.com/elonmusk 或 @elonmusk" required />
+          </label>
+          <label>登录态文件
+            <input type="text" name="state" value="auth_state_cookie.json" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="headless" value="1" checked />
+            <span>无头模式运行</span>
+          </label>
+          <button class="btn" type="submit">开始抓取历史推文</button>
+        </form>
+
+        <form class="panel js-task-form" data-kind="user_following">
+          <h2>抓取某个博主关注用户列表</h2>
+          <p>输入 `x.com` 用户主页，通过内部接口抓取其关注列表，并生成详细画像报告。</p>
+          <label>用户主页
+            <input type="text" name="user_url" placeholder="https://x.com/elonmusk 或 @elonmusk" required />
+          </label>
+          <label>登录态文件
+            <input type="text" name="state" value="auth_state_cookie.json" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="headless" value="1" checked />
+            <span>无头模式运行</span>
+          </label>
+          <button class="btn alt" type="submit">开始抓取关注列表</button>
+        </form>
+
         <section class="panel">
           <h2>一键批量发邮件</h2>
           <p>把已生成的报告作为附件，按收件人列表逐封发送。适合把结果直接推给客户、团队或订阅用户。</p>
@@ -1828,7 +1940,13 @@ def render_page() -> str:
     async function submitTask(form) {
       const formData = new FormData(form);
       const kind = form.dataset.kind;
-      const endpoint = kind === "keyword" ? "/api/tasks/keyword" : "/api/tasks/following";
+      const endpointMap = {
+        keyword: "/api/tasks/keyword",
+        following: "/api/tasks/following",
+        user_timeline: "/api/tasks/user-timeline",
+        user_following: "/api/tasks/user-following"
+      };
+      const endpoint = endpointMap[kind];
       const button = form.querySelector("button[type='submit']");
       button.disabled = true;
       try {
@@ -2100,6 +2218,38 @@ def api_task_following():
     task_id = start_task(
         "following",
         {
+            "state": (request.form.get("state") or DEFAULT_STATE).strip(),
+            "headless": request.form.get("headless") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/user-timeline")
+def api_task_user_timeline():
+    user_url = (request.form.get("user_url") or "").strip()
+    if not user_url:
+        return jsonify({"error": "用户主页不能为空。"}), 400
+    task_id = start_task(
+        "user_timeline",
+        {
+            "user_url": user_url,
+            "state": (request.form.get("state") or DEFAULT_STATE).strip(),
+            "headless": request.form.get("headless") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/user-following")
+def api_task_user_following():
+    user_url = (request.form.get("user_url") or "").strip()
+    if not user_url:
+        return jsonify({"error": "用户主页不能为空。"}), 400
+    task_id = start_task(
+        "user_following",
+        {
+            "user_url": user_url,
             "state": (request.form.get("state") or DEFAULT_STATE).strip(),
             "headless": request.form.get("headless") == "1",
         },
