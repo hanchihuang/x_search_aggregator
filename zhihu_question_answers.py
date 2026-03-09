@@ -11,6 +11,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
+from urllib import parse as urlparse
+from urllib import request as urlrequest
 
 from playwright.sync_api import TimeoutError, sync_playwright
 
@@ -79,11 +81,74 @@ def parse_cookie_string(cookie_string: str) -> List[Dict]:
     return cookies
 
 
+def cookie_header_from_string(cookie_string: str) -> str:
+    parts = []
+    for chunk in str(cookie_string or "").split(";"):
+        part = chunk.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name:
+            parts.append(f"{name}={value}")
+    if not parts:
+        raise ValueError("Cookie 为空或格式不正确。请粘贴浏览器请求头里的完整 Cookie 字符串。")
+    return "; ".join(parts)
+
+
 def create_run_dir(base_dir: Path, question_id: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = base_dir / f"zhihu_question_{question_id}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
+
+
+def fetch_answer_urls_via_api(question_id: str, cookie_header: str, user_agent: str, page_delay_ms: int) -> List[str]:
+    found: List[str] = []
+    seen: set[str] = set()
+    limit = 20
+    offset = 0
+    totals = 0
+    page_no = 0
+    while True:
+        page_no += 1
+        next_url = (
+            f"https://www.zhihu.com/api/v4/questions/{question_id}/answers"
+            f"?limit={limit}&offset={offset}&sort_by=default&include=data[*].author.name"
+        )
+        req = urlrequest.Request(
+            next_url,
+            headers={
+                "Cookie": cookie_header,
+                "User-Agent": user_agent,
+                "Accept": "application/json, text/plain, */*",
+                "Referer": f"https://www.zhihu.com/question/{question_id}",
+                "X-Requested-With": "fetch",
+            },
+        )
+        with urlrequest.urlopen(req, timeout=45) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "ignore"))
+        data = list(payload.get("data") or [])
+        new_items = 0
+        for item in data:
+            answer_id = str(item.get("id") or "").strip()
+            if not answer_id:
+                continue
+            answer_url = f"https://www.zhihu.com/question/{question_id}/answer/{answer_id}"
+            if answer_url in seen:
+                continue
+            seen.add(answer_url)
+            found.append(answer_url)
+            new_items += 1
+        totals = int(payload.get("paging", {}).get("totals", totals) or totals or 0)
+        print(f"API page {page_no}: + {new_items} new, total {len(found)} / {totals or '?'}")
+        if totals and len(found) >= totals:
+            break
+        if not data or new_items == 0:
+            break
+        offset += limit
+    return found
 
 
 def scroll_question_page(page, question_id: str, max_scrolls: int, no_new_stop: int, page_delay_ms: int) -> List[str]:
@@ -449,6 +514,7 @@ def write_outputs(run_dir: Path, question_title: str, question_url: str, rows: L
 def main() -> int:
     args = parse_args()
     question_url, question_id = ensure_question_url(args.question_url)
+    cookie_header = cookie_header_from_string(args.cookie)
     cookies = parse_cookie_string(args.cookie)
     output_base = Path(args.out_dir)
     output_base.mkdir(parents=True, exist_ok=True)
@@ -477,7 +543,13 @@ def main() -> int:
 
         question_title = first_text(page, ["h1.QuestionHeader-title", "h1"]) or f"知乎问题 {question_id}"
         print(f"Question title: {question_title}")
-        answer_urls = scroll_question_page(page, question_id, args.max_scrolls, args.no_new_stop, args.page_delay_ms)
+        answer_urls: List[str] = []
+        try:
+            answer_urls = fetch_answer_urls_via_api(question_id, cookie_header, args.user_agent, args.page_delay_ms)
+        except Exception as exc:
+            print(f"[SYSTEM] 知乎回答 API 拉取失败，回退到页面滚动模式: {exc}")
+        if not answer_urls:
+            answer_urls = scroll_question_page(page, question_id, args.max_scrolls, args.no_new_stop, args.page_delay_ms)
         if not answer_urls:
             raise RuntimeError("没有抓到任何回答链接。请检查 Cookie 是否仍然有效，或确认该问题页在当前账号下可见。")
         print(f"Discovered {len(answer_urls)} answer links")
