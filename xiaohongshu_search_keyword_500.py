@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Search Xiaohongshu notes and hydrate top 500 results.")
     parser.add_argument("--keyword", required=True, help="Search keyword")
     parser.add_argument("--cookie", required=True, help="Cookie header copied from the browser request")
+    parser.add_argument("--resume-dir", default="", help="Resume hydration from an existing run directory")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="Optional browser user agent")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
     parser.add_argument("--out-dir", default="output", help="Output base directory")
@@ -75,6 +76,14 @@ def ensure_search_ready(page) -> None:
         raise RuntimeError("小红书搜索页触发安全限制，请切换网络环境或更新 Cookie 后重试。")
     if "登录后查看更多" in body_text or "手机号登录" in body_text or detect_login_overlay(page):
         raise RuntimeError("小红书搜索页需要有效登录态，请填写可用 Cookie 后重试。")
+
+
+def ensure_detail_ready(page) -> None:
+    body_text = (page.locator("body").inner_text(timeout=4000) or "").strip()
+    if "IP存在风险" in body_text or "安全限制" in body_text:
+        raise RuntimeError("小红书详情页触发安全限制，请切换网络环境或更新 Cookie 后重试。")
+    if "/404" in page.url or "当前笔记暂时无法浏览" in body_text or "请打开小红书App扫码查看" in body_text:
+        raise RuntimeError("当前笔记暂时无法通过网页版访问，需在小红书 App 内查看。")
 
 
 def collect_result_candidates(page) -> List[Dict]:
@@ -373,29 +382,69 @@ def write_outputs(run_dir: Path, keyword: str, search_url: str, rows: List[Dict]
     (run_dir / "article.html").write_text(build_html(keyword, search_url, rows), encoding="utf-8")
 
 
+def load_existing_hydrated(run_dir: Path) -> List[Dict]:
+    path = run_dir / "results.json"
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return list(payload.get("items", []))
+
+
+def load_failure_list(path: Path) -> List[Dict]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return list(payload if isinstance(payload, list) else [])
+
+
 def hydrate_details(context, items: List[Dict], detail_delay_ms: int, comment_scrolls: int, run_dir: Path, keyword: str, search_url: str, checkpoint_every: int) -> List[Dict]:
-    hydrated: List[Dict] = []
-    failures: List[Dict] = []
+    hydrated: List[Dict] = load_existing_hydrated(run_dir)
+    failures: List[Dict] = load_failure_list(run_dir / "failed_details.json")
+    unavailable: List[Dict] = load_failure_list(run_dir / "unavailable_details.json")
     total = len(items)
-    write_progress(run_dir, total, 0, 0, 0)
+    hydrated_urls = {row.get("url", "") for row in hydrated if row.get("url")}
+    unavailable_urls = {row.get("url", "") for row in unavailable if row.get("url")}
+    failed_urls = {row.get("url", "") for row in failures if row.get("url")}
+    processed = len(hydrated) + len(unavailable) + len(failures)
+    write_outputs(run_dir, keyword, search_url, hydrated)
+    write_json(run_dir / "failed_details.json", failures)
+    write_json(run_dir / "unavailable_details.json", unavailable)
+    write_progress(run_dir, total, processed, len(hydrated), len(unavailable) + len(failures))
 
     for index, item in enumerate(items, start=1):
+        if item.get("url") in hydrated_urls or item.get("url") in unavailable_urls or item.get("url") in failed_urls:
+            continue
         page = context.new_page()
         try:
             page.goto(item["url"], wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(detail_delay_ms)
-            ensure_search_ready(page)
+            ensure_detail_ready(page)
             print(f"[FULLTEXT] {index}/{total} {item.get('title', '')}")
             hydrated_item = extract_note_detail(page, item, detail_delay_ms, comment_scrolls)
             hydrated.append(hydrated_item)
+            hydrated_urls.add(item.get("url", ""))
         except Exception as exc:
-            failures.append({**item, "error": str(exc)})
+            error_text = str(exc)
+            if "当前笔记暂时无法通过网页版访问" in error_text:
+                unavailable.append({**item, "error": error_text})
+                unavailable_urls.add(item.get("url", ""))
+            else:
+                failures.append({**item, "error": error_text})
+                failed_urls.add(item.get("url", ""))
         finally:
             page.close()
-        write_progress(run_dir, total, index, len(hydrated), len(failures))
-        if index % checkpoint_every == 0 or index == total:
+        processed += 1
+        write_progress(run_dir, total, processed, len(hydrated), len(unavailable) + len(failures))
+        if processed % checkpoint_every == 0 or processed == total:
             write_outputs(run_dir, keyword, search_url, hydrated)
             write_json(run_dir / "failed_details.json", failures)
+            write_json(run_dir / "unavailable_details.json", unavailable)
     return hydrated
 
 
@@ -403,7 +452,8 @@ def main() -> int:
     args = parse_args()
     output_base = Path(args.out_dir)
     output_base.mkdir(parents=True, exist_ok=True)
-    run_dir = create_run_dir(output_base, args.keyword)
+    resume_dir = Path(args.resume_dir).expanduser().resolve() if args.resume_dir else None
+    run_dir = resume_dir if resume_dir else create_run_dir(output_base, args.keyword)
     search_url = make_search_url(args.keyword)
     print(f"Run directory: {run_dir.resolve()}")
     print(f"Search URL: {search_url}")
@@ -423,14 +473,26 @@ def main() -> int:
             context.add_cookies(cookies)
 
         page = context.new_page()
-        page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_timeout(args.page_delay_ms)
-        ensure_search_ready(page)
-        stage1_items = extract_search_results(page, args.max_items, args.max_scrolls, args.no_new_stop, args.page_delay_ms)
-        if not stage1_items:
-            raise RuntimeError("没有抓到任何小红书搜索结果。请检查关键词、Cookie 或网络环境。")
-        print(f"成功收集 {len(stage1_items)} 条小红书搜索结果")
-        write_stage1(run_dir, args.keyword, search_url, stage1_items)
+        if resume_dir:
+            stage1_path = run_dir / "results_stage1.json"
+            if not stage1_path.exists():
+                raise RuntimeError(f"恢复目录缺少阶段1文件：{stage1_path}")
+            payload = json.loads(stage1_path.read_text(encoding="utf-8"))
+            search_url = str(payload.get("search_url") or search_url)
+            stage1_items = list(payload.get("items", []))
+            if not stage1_items:
+                raise RuntimeError(f"阶段1文件里没有可恢复的结果：{stage1_path}")
+            print(f"从已有目录恢复补全: {run_dir}")
+            print(f"阶段1结果数量: {len(stage1_items)}")
+        else:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(args.page_delay_ms)
+            ensure_search_ready(page)
+            stage1_items = extract_search_results(page, args.max_items, args.max_scrolls, args.no_new_stop, args.page_delay_ms)
+            if not stage1_items:
+                raise RuntimeError("没有抓到任何小红书搜索结果。请检查关键词、Cookie 或网络环境。")
+            print(f"成功收集 {len(stage1_items)} 条小红书搜索结果")
+            write_stage1(run_dir, args.keyword, search_url, stage1_items)
 
         print("开始第二阶段：逐条补全小红书正文与评论")
         hydrated = hydrate_details(
@@ -451,6 +513,7 @@ def main() -> int:
     print(f"Results stage1: {run_dir / 'results_stage1.json'}")
     print(f"Results JSON: {run_dir / 'results.json'}")
     print(f"Comments JSON: {run_dir / 'comments.json'}")
+    print(f"Unavailable details: {run_dir / 'unavailable_details.json'}")
     print(f"Article HTML: {run_dir / 'article.html'}")
     return 0
 

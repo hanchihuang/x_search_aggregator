@@ -113,7 +113,7 @@ python web_app.py
 | 👥 **博主关注列表** | `crawl_user_following.py` | 输入任意 `x.com` 用户主页，抓取其关注用户列表并生成画像报告 |
 | 📘 **知乎问题回答全文** | `zhihu_question_answers.py` | 输入知乎问题链接 + Cookie，抓取该问题下所有回答完整文本 |
 | 📗 **知乎搜索前 500 条全文** | `zhihu_search_keyword_500.py` | 输入关键词 + Cookie，先保存前 500 条摘要和链接，再逐条补全文 |
-| 📕 **小红书搜索前 500 条全文** | `xiaohongshu_search_keyword_500.py` | 输入关键词 + Cookie，先保存前 500 条链接和摘要，再逐条补正文、图片和评论 |
+| 📕 **小红书搜索前 500 条全文** | `xiaohongshu_search_keyword_500.py` | 输入关键词 + Cookie，先保存前 500 条链接和摘要，再逐条补正文、图片和评论；网页版被 `300031` 限制的条目会单独记档 |
 | 📕 **小红书博主全部笔记** | `xiaohongshu_user_notes.py` | 先抓博主全部公开卡片；填写 Cookie 后继续抓正文、全部图片和评论 |
 | 📊 **有用程度排名** | `rank_usefulness.py` | 对任意采集结果按有用程度智能评分，生成可视化排名 HTML |
 | 🖥️ **本地前端控制台** | `web_app.py` | 浏览器里输入关键词 / 点击按钮执行抓取，异步查看进度、日志和 HTML 结果 |
@@ -140,7 +140,7 @@ python web_app.py
 - 输入任意 `x.com` 博主主页，抓取其关注用户列表，并生成详细画像报告
 - 输入任意 `zhihu.com/question/...` 问题链接，粘贴浏览器请求头里的 Cookie，抓取全部回答全文
 - 输入知乎搜索关键词，粘贴浏览器请求头里的 Cookie，抓取前 500 条搜索结果并保存两阶段文件
-- 输入小红书搜索关键词，粘贴浏览器请求头里的 Cookie，先抓前 500 条摘要和链接，再逐条补正文和评论
+- 输入小红书搜索关键词，粘贴浏览器请求头里的 Cookie，先抓前 500 条摘要和链接，再逐条补正文和评论；网页版不可访问的笔记会单独标记
 - 输入小红书博主主页链接；若填写小红书 Cookie，则继续抓正文、全部图片和评论
 - 异步查看任务进度、实时日志、最近新增条数、已抓取条数、滚动轮次
 - 在页面里查看最近生成的输出目录、切换历史任务、停止运行中的任务
@@ -231,7 +231,7 @@ python xiaohongshu_search_keyword_500.py \
   --cookie "<从浏览器 Network 请求头复制的小红书 Cookie>"
 ```
 
-> 第一阶段会保存 `results_stage1.json`，包含前 500 条链接和摘要；第二阶段会逐条打开详情页，抓正文、图片和评论，并保存到 `results.json`、`comments.json`、`results.csv`、`all_notes.md`、`failed_details.json`、`fulltext_progress.json` 和 `article.html`。
+> 第一阶段会保存 `results_stage1.json`，包含前 500 条链接和摘要；第二阶段会逐条打开详情页，抓正文、图片和评论，并保存到 `results.json`、`comments.json`、`results.csv`、`all_notes.md`、`unavailable_details.json`、`failed_details.json`、`fulltext_progress.json` 和 `article.html`。其中被小红书网页版返回 `300031 / 当前笔记暂时无法浏览` 的条目会记入 `unavailable_details.json`，只能保留摘要。
 
 #### 📕 爬取小红书博主全部笔记并补正文 / 图片 / 评论
 
@@ -342,6 +342,21 @@ output/xiaohongshu_user_<profile_id>_<timestamp>/
 ├── all_notes.md              # 全量 Markdown
 ├── fulltext_progress.json    # 第二阶段进度
 ├── failed_details.json       # 详情抓取失败记录
+└── article.html              # 浏览器可读页面
+```
+
+**小红书搜索前 500 条两阶段输出**：
+
+```
+output/xiaohongshu_search_<keyword>_500_<timestamp>/
+├── results_stage1.json       # 第一阶段：前 500 条摘要和链接
+├── results.json              # 第二阶段：成功补全的正文 / 图片 / 评论
+├── comments.json             # 成功补全条目的评论结构化结果
+├── results.csv               # 成功补全结果表格
+├── all_notes.md              # 成功补全结果 Markdown
+├── fulltext_progress.json    # 第二阶段进度
+├── unavailable_details.json  # 网页版被 300031 限制、只能保留摘要的条目
+├── failed_details.json       # 其他详情抓取失败记录
 └── article.html              # 浏览器可读页面
 ```
 

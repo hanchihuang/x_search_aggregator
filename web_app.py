@@ -510,6 +510,7 @@ def run_report_files(run_dir: Path) -> List[Dict]:
         ("结果 JSON", run_dir / "results.json"),
         ("阶段1结果 JSON", run_dir / "results_stage1.json"),
         ("评论 JSON", run_dir / "comments.json"),
+        ("网页版不可访问详情", run_dir / "unavailable_details.json"),
         ("详情失败记录", run_dir / "failed_details.json"),
         ("全文补全进度", run_dir / "fulltext_progress.json"),
         ("结果 CSV", run_dir / "results.csv"),
@@ -1874,7 +1875,7 @@ def render_page() -> str:
 
         <form class="panel js-task-form" data-kind="xiaohongshu_search">
           <h2>抓取小红书搜索前 500 条全文</h2>
-          <p>输入关键词后，系统会先保存前 500 条结果的链接和摘要到 `results_stage1.json`，再逐条打开详情页抓取正文、图片和评论，保存到 `results.json` 与 `comments.json`。</p>
+          <p>输入关键词后，系统会先保存前 500 条结果的链接和摘要到 `results_stage1.json`，再逐条打开详情页抓取正文、图片和评论。部分笔记会被小红书网页端返回 `300031`，这类条目只能保留摘要并记入 `unavailable_details.json`。</p>
           <label>搜索关键词
             <input type="text" name="keyword" placeholder="例如 AI Agent / 自动驾驶 / 咖啡店创业" required />
           </label>
@@ -1888,7 +1889,7 @@ def render_page() -> str:
             <input type="checkbox" name="headless" value="1" checked />
             <span>无头模式运行</span>
           </label>
-          <div class="mini-note">输出目录会包含 `results_stage1.json`、`results.json`、`comments.json`、`results.csv`、`all_notes.md`、`failed_details.json`、`fulltext_progress.json` 和 `article.html`。</div>
+          <div class="mini-note">输出目录会包含 `results_stage1.json`、`results.json`、`comments.json`、`results.csv`、`all_notes.md`、`unavailable_details.json`、`failed_details.json`、`fulltext_progress.json` 和 `article.html`。</div>
           <button class="btn alt" type="submit">开始抓取小红书搜索</button>
         </form>
 
