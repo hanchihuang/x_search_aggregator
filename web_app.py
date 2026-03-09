@@ -35,6 +35,7 @@ MAILER_DB_PATH = BASE_DIR / "output" / ".web_mailer.json"
 DEFAULT_STATE = "auth_state_cookie.json"
 DEFAULT_ZHIHU_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 DEFAULT_ZHIHU_COOKIE = os.environ.get("ZHIHU_DEFAULT_COOKIE", "").strip()
+DEFAULT_XHS_COOKIE = os.environ.get("XHS_DEFAULT_COOKIE", "").strip()
 LOG_LIMIT = 1200
 SCROLL_RE = re.compile(r"(?:滚动|Scroll)\s+(\d+)(?:/(\d+))?.*?共\s+(\d+)\s*条", re.IGNORECASE)
 SCROLL_EN_RE = re.compile(r"Scroll\s+(\d+)(?:/(\d+))?:\s*\+\s*(\d+)\s+new,\s+total\s+(\d+)", re.IGNORECASE)
@@ -81,7 +82,7 @@ MAILER_LOCK = threading.Lock()
 
 def sanitize_task_params(task_type: str, params: Dict) -> Dict:
     payload = dict(params or {})
-    if task_type in {"zhihu_question", "zhihu_search"} and payload.get("cookie"):
+    if task_type in {"zhihu_question", "zhihu_search", "xiaohongshu_user"} and payload.get("cookie"):
         payload["cookie"] = "[hidden]"
     return payload
 
@@ -503,9 +504,11 @@ def run_report_files(run_dir: Path) -> List[Dict]:
         ("摘要页", run_dir / "summary.html"),
         ("知乎回答全文", run_dir / "all_answers.md"),
         ("知乎搜索全文", run_dir / "all_results.md"),
+        ("小红书笔记全文", run_dir / "all_notes.md"),
         ("评分 JSON", run_dir / "usefulness_ranking.json"),
         ("结果 JSON", run_dir / "results.json"),
         ("阶段1结果 JSON", run_dir / "results_stage1.json"),
+        ("评论 JSON", run_dir / "comments.json"),
         ("详情失败记录", run_dir / "failed_details.json"),
         ("全文补全进度", run_dir / "fulltext_progress.json"),
         ("结果 CSV", run_dir / "results.csv"),
@@ -865,6 +868,15 @@ def infer_progress(task: Dict, line: str) -> None:
     elif "[detail]" in lowered:
         task["stage"] = "正在逐条抓取详情全文"
         task["progress"] = max(task["progress"], 84)
+    elif "profile url:" in lowered:
+        task["stage"] = "正在打开小红书主页"
+        task["progress"] = max(task["progress"], 8)
+    elif "user name:" in lowered:
+        task["stage"] = "正在滚动收集笔记"
+        task["progress"] = max(task["progress"], 12)
+    elif "成功收集" in line and "小红书笔记" in line:
+        task["stage"] = "正在整理输出"
+        task["progress"] = max(task["progress"], 92)
 
 
 def update_task(task_id: str, **changes) -> None:
@@ -1230,6 +1242,30 @@ def run_zhihu_search_job(task_id: str, keyword: str, cookie: str, user_agent: st
     )
 
 
+def run_xiaohongshu_user_job(task_id: str, user_url: str, cookie: str, headless: bool) -> None:
+    before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
+    cmd = [sys.executable, "xiaohongshu_user_notes.py", "--user-url", user_url]
+    if cookie:
+        cmd.extend(["--cookie", cookie])
+    if headless:
+        cmd.append("--headless")
+    code = run_command_stream(task_id, cmd, "正在抓取小红书博主笔记", 5)
+    if code != 0:
+        raise RuntimeError("小红书博主笔记抓取失败，请检查日志。")
+
+    run_dir = detect_newest_dir(before)
+    if run_dir is None:
+        raise RuntimeError("小红书博主笔记抓取完成，但未找到输出目录。")
+
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"小红书博主笔记抓取完成：{user_url}",
+        stage="已完成",
+        progress=100,
+    )
+
+
 def worker(task_id: str) -> None:
     update_task(task_id, status="running", stage="准备启动", progress=2)
     try:
@@ -1264,6 +1300,8 @@ def worker(task_id: str) -> None:
                 params.get("user_agent", ""),
                 params["headless"],
             )
+        elif task["type"] == "xiaohongshu_user":
+            run_xiaohongshu_user_job(task_id, params["user_url"], params.get("cookie", ""), params["headless"])
         else:
             run_email_job(task_id, params)
         with TASKS_LOCK:
@@ -1300,6 +1338,7 @@ def start_task(task_type: str, params: Dict) -> str:
 def render_page() -> str:
     safe_cookie = html.escape(DEFAULT_ZHIHU_COOKIE)
     safe_user_agent = html.escape(DEFAULT_ZHIHU_USER_AGENT)
+    safe_xhs_cookie = html.escape(DEFAULT_XHS_COOKIE)
     return """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1782,6 +1821,23 @@ def render_page() -> str:
           <button class="btn alt" type="submit">开始抓取知乎搜索</button>
         </form>
 
+        <form class="panel js-task-form" data-kind="xiaohongshu_user">
+          <h2>一键爬取小红书博主全部笔记</h2>
+          <p>输入小红书博主主页链接。系统会先滚动抓全公开卡片；若填写了小红书 Cookie，则继续逐条打开详情抓正文、全部图片和评论。</p>
+          <label>博主主页
+            <input type="text" name="user_url" placeholder="https://www.xiaohongshu.com/user/profile/..." required />
+          </label>
+          <label>Cookie 字符串
+            <textarea name="cookie" placeholder="如需抓正文、图片和评论，请填写小红书 Cookie；留空则只抓公开卡片摘要">__DEFAULT_XHS_COOKIE__</textarea>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="headless" value="1" checked />
+            <span>无头模式运行</span>
+          </label>
+          <div class="mini-note">输出目录会包含 `results_stage1.json`、`results.json`、`comments.json`、`results.csv`、`all_notes.md`、`fulltext_progress.json` 和 `article.html`。</div>
+          <button class="btn" type="submit">开始抓取小红书博主</button>
+        </form>
+
         <section class="panel">
           <h2>一键批量发邮件</h2>
           <p>把已生成的报告作为附件，按收件人列表逐封发送。适合把结果直接推给客户、团队或订阅用户。</p>
@@ -2218,7 +2274,8 @@ def render_page() -> str:
         user_timeline: "/api/tasks/user-timeline",
         user_following: "/api/tasks/user-following",
         zhihu_question: "/api/tasks/zhihu-question",
-        zhihu_search: "/api/tasks/zhihu-search"
+        zhihu_search: "/api/tasks/zhihu-search",
+        xiaohongshu_user: "/api/tasks/xiaohongshu-user"
       };
       const endpoint = endpointMap[kind];
       const button = form.querySelector("button[type='submit']");
@@ -2398,7 +2455,7 @@ def render_page() -> str:
 </body>
 </html>""".replace("__DEFAULT_ZHIHU_COOKIE__", safe_cookie).replace(
         "__DEFAULT_ZHIHU_USER_AGENT__", safe_user_agent
-    )
+    ).replace("__DEFAULT_XHS_COOKIE__", safe_xhs_cookie)
 
 
 @app.get("/")
@@ -2570,6 +2627,22 @@ def api_task_zhihu_search():
             "keyword": keyword,
             "cookie": cookie,
             "user_agent": (request.form.get("user_agent") or "").strip(),
+            "headless": request.form.get("headless") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/xiaohongshu-user")
+def api_task_xiaohongshu_user():
+    user_url = (request.form.get("user_url") or "").strip()
+    if not user_url:
+        return jsonify({"error": "小红书博主主页不能为空。"}), 400
+    task_id = start_task(
+        "xiaohongshu_user",
+        {
+            "user_url": user_url,
+            "cookie": (request.form.get("cookie") or "").strip(),
             "headless": request.form.get("headless") == "1",
         },
     )
