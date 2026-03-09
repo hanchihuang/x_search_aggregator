@@ -73,6 +73,8 @@ python web_app.py
 - 点击关注流任务，生成关注者动态排序页
 - 输入任意 `x.com` 用户主页，抓取该博主全部历史推文
 - 输入任意 `x.com` 用户主页，抓取该博主关注用户列表
+- 输入任意 `zhihu.com/question/...` 问题链接，抓取该问题下所有回答完整文本
+- 输入知乎关键词，抓取搜索前 500 条结果摘要与链接，再逐条补全文
 - 在同一个页面里看任务日志、进度条和历史任务
 - 直接点击生成结果打开 HTML
 
@@ -107,6 +109,8 @@ python web_app.py
 | 📡 **关注者最新动态 500** | `crawl_following_timeline_500.py` | 一键抓取你关注的所有人的最新 **500 条**动态 |
 | 📜 **博主全部历史推文** | `crawl_user_timeline.py` | 输入任意 `x.com` 用户主页，尽量抓取其全部历史推文 |
 | 👥 **博主关注列表** | `crawl_user_following.py` | 输入任意 `x.com` 用户主页，抓取其关注用户列表并生成画像报告 |
+| 📘 **知乎问题回答全文** | `zhihu_question_answers.py` | 输入知乎问题链接 + Cookie，抓取该问题下所有回答完整文本 |
+| 📗 **知乎搜索前 500 条全文** | `zhihu_search_keyword_500.py` | 输入关键词 + Cookie，先保存前 500 条摘要和链接，再逐条补全文 |
 | 📊 **有用程度排名** | `rank_usefulness.py` | 对任意采集结果按有用程度智能评分，生成可视化排名 HTML |
 | 🖥️ **本地前端控制台** | `web_app.py` | 浏览器里输入关键词 / 点击按钮执行抓取，异步查看进度、日志和 HTML 结果 |
 | 🐟 **BettaFish 集成** | `web_app.py` | 配置本地 BettaFish 路径并在控制台中启动 / 停止 / 打开它 |
@@ -130,6 +134,8 @@ python web_app.py
 - 一键抓取你关注的所有人最新动态，并打开排序页 / 摘要页 / 文章页
 - 输入任意 `x.com` 博主主页，抓取其全部历史推文，并生成文章页 / 详细报告 / 排序页
 - 输入任意 `x.com` 博主主页，抓取其关注用户列表，并生成详细画像报告
+- 输入任意 `zhihu.com/question/...` 问题链接，粘贴浏览器请求头里的 Cookie，抓取全部回答全文
+- 输入知乎搜索关键词，粘贴浏览器请求头里的 Cookie，抓取前 500 条搜索结果并保存两阶段文件
 - 异步查看任务进度、实时日志、最近新增条数、已抓取条数、滚动轮次
 - 在页面里查看最近生成的输出目录、切换历史任务、停止运行中的任务
 - 页面关闭或服务重启后，任务状态会从磁盘恢复
@@ -190,6 +196,26 @@ python crawl_user_timeline.py --user-url "https://x.com/elonmusk" --max-items 0
 ```bash
 python crawl_user_following.py --user-url "https://x.com/elonmusk" --max-items 0
 ```
+
+#### 📘 爬取知乎问题的所有回答全文
+
+```bash
+python zhihu_question_answers.py \
+  --question-url "https://www.zhihu.com/question/547768388" \
+  --cookie "<从浏览器 Network 请求头复制的完整 Cookie>"
+```
+
+> 当前实现依赖有效的知乎 Cookie。输出目录会生成 `results.json`、`results.csv`、`all_answers.md` 和 `article.html`。
+
+#### 📗 爬取知乎搜索前 500 条结果并补全文
+
+```bash
+python zhihu_search_keyword_500.py \
+  --keyword "自动驾驶强化学习" \
+  --cookie "<从浏览器 Network 请求头复制的完整 Cookie>"
+```
+
+> 第一阶段会保存 `results_stage1.json`，包含摘要和链接；第二阶段会逐条打开详情页并保存到 `results.json`、`results.csv`、`all_results.md`、`fulltext_progress.json` 和 `article.html`。
 
 #### 🧩 对已有结果补全全文
 
@@ -254,6 +280,29 @@ output/<任意推文采集目录>/
 ├── results_stage1.json       # 第一阶段：列表页摘要/链接快照
 ├── results.json              # 第二阶段：补全全文后的最终结果
 └── fulltext_progress.json    # 全文补全过程进度
+```
+
+**知乎问题回答全文**输出：
+
+```
+output/zhihu_question_<question_id>_<timestamp>/
+├── results.json              # 回答全文结构化结果
+├── results.csv               # 回答全文表格
+├── all_answers.md            # 全部回答 Markdown
+└── article.html              # 浏览器可读页面
+```
+
+**知乎搜索前 500 条两阶段输出**：
+
+```
+output/zhihu_search_<keyword>_500_<timestamp>/
+├── results_stage1.json       # 第一阶段：前 500 条摘要和链接
+├── results.json              # 第二阶段：逐条补全文后的结果
+├── results.csv               # 全文表格
+├── all_results.md            # 全文 Markdown
+├── fulltext_progress.json    # 全文补全过程进度
+├── failed_details.json       # 打开详情页失败的记录
+└── article.html              # 浏览器可读页面
 ```
 
 **用户关注列表**额外输出：
@@ -361,6 +410,8 @@ output/following_vista8_20260306/
 - 关注流抓取：提交后后台异步执行 `crawl_following_timeline_500.py` + `rank_usefulness.py`
 - 博主历史推文抓取：提交后后台异步执行 `crawl_user_timeline.py` + `rank_usefulness.py`
 - 博主关注列表抓取：提交后后台异步执行 `crawl_user_following.py`
+- 知乎问题回答全文：提交后后台异步执行 `zhihu_question_answers.py`
+- 知乎搜索前 500 条全文：提交后后台异步执行 `zhihu_search_keyword_500.py`
 - 多任务队列：可切换查看历史任务、运行中任务、失败任务
 - 实时进度：显示目标条数、已抓取条数、滚动轮次、最近新增条数
 - 停止任务：可终止当前运行中的抓取子进程
@@ -450,6 +501,8 @@ output/following_vista8_20260306/
 x_search_aggregator/
 ├── search_keyword_500.py          # ⭐ 关键词搜索 500 条
 ├── crawl_following_timeline_500.py # ⭐ 关注者动态 500 条
+├── zhihu_question_answers.py      # 知乎问题回答全文
+├── zhihu_search_keyword_500.py    # 知乎搜索前 500 条两阶段抓取
 ├── search_x.py                    # 关键词搜索（自定义数量）
 ├── crawl_user_timeline.py         # 用户历史推文爬取
 ├── crawl_user_following.py        # 用户关注列表爬取

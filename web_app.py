@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import html
 import mimetypes
 import os
 import re
@@ -32,6 +33,8 @@ TASKS_DB_PATH = BASE_DIR / "output" / ".web_tasks.json"
 INTEGRATIONS_DB_PATH = BASE_DIR / "output" / ".web_integrations.json"
 MAILER_DB_PATH = BASE_DIR / "output" / ".web_mailer.json"
 DEFAULT_STATE = "auth_state_cookie.json"
+DEFAULT_ZHIHU_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+DEFAULT_ZHIHU_COOKIE = os.environ.get("ZHIHU_DEFAULT_COOKIE", "").strip()
 LOG_LIMIT = 1200
 SCROLL_RE = re.compile(r"(?:滚动|Scroll)\s+(\d+)(?:/(\d+))?.*?共\s+(\d+)\s*条", re.IGNORECASE)
 SCROLL_EN_RE = re.compile(r"Scroll\s+(\d+)(?:/(\d+))?:\s*\+\s*(\d+)\s+new,\s+total\s+(\d+)", re.IGNORECASE)
@@ -76,11 +79,18 @@ MAILER: Dict[str, object] = {
 MAILER_LOCK = threading.Lock()
 
 
+def sanitize_task_params(task_type: str, params: Dict) -> Dict:
+    payload = dict(params or {})
+    if task_type in {"zhihu_question", "zhihu_search"} and payload.get("cookie"):
+        payload["cookie"] = "[hidden]"
+    return payload
+
+
 def task_to_disk_record(task: Dict) -> Dict:
     return {
         "id": task["id"],
         "type": task["type"],
-        "params": task["params"],
+        "params": sanitize_task_params(task["type"], task["params"]),
         "status": task["status"],
         "stage": task["stage"],
         "progress": task["progress"],
@@ -491,9 +501,12 @@ def run_report_files(run_dir: Path) -> List[Dict]:
         ("价值排序页", run_dir / "usefulness_ranking.html"),
         ("深度文章页", run_dir / "article.html"),
         ("摘要页", run_dir / "summary.html"),
+        ("知乎回答全文", run_dir / "all_answers.md"),
+        ("知乎搜索全文", run_dir / "all_results.md"),
         ("评分 JSON", run_dir / "usefulness_ranking.json"),
         ("结果 JSON", run_dir / "results.json"),
         ("阶段1结果 JSON", run_dir / "results_stage1.json"),
+        ("详情失败记录", run_dir / "failed_details.json"),
         ("全文补全进度", run_dir / "fulltext_progress.json"),
         ("结果 CSV", run_dir / "results.csv"),
         ("摘要 Markdown", run_dir / "summary.md"),
@@ -837,6 +850,21 @@ def infer_progress(task: Dict, line: str) -> None:
     elif "获取个人账号关注的所有人的最新500条动态" in line:
         task["stage"] = "正在打开关注流"
         task["progress"] = max(task["progress"], 8)
+    elif "question title:" in lowered:
+        task["stage"] = "正在收集回答链接"
+        task["progress"] = max(task["progress"], 10)
+    elif "discovered" in lowered and "answer links" in lowered:
+        task["stage"] = "正在逐条抓取回答全文"
+        task["progress"] = max(task["progress"], 26)
+    elif "[answer]" in lowered:
+        task["stage"] = "正在逐条抓取回答全文"
+        task["progress"] = max(task["progress"], 28)
+    elif "开始第二阶段：逐条补全知乎全文" in line:
+        task["stage"] = "正在补全文"
+        task["progress"] = max(task["progress"], 82)
+    elif "[detail]" in lowered:
+        task["stage"] = "正在逐条抓取详情全文"
+        task["progress"] = max(task["progress"], 84)
 
 
 def update_task(task_id: str, **changes) -> None:
@@ -1154,6 +1182,54 @@ def run_user_following_job(task_id: str, user_url: str, state: str, headless: bo
     )
 
 
+def run_zhihu_question_job(task_id: str, question_url: str, cookie: str, user_agent: str, headless: bool) -> None:
+    before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
+    cmd = [sys.executable, "zhihu_question_answers.py", "--question-url", question_url, "--cookie", cookie]
+    if user_agent:
+        cmd.extend(["--user-agent", user_agent])
+    if headless:
+        cmd.append("--headless")
+    code = run_command_stream(task_id, cmd, "正在抓取知乎问题回答", 5)
+    if code != 0:
+        raise RuntimeError("知乎回答抓取失败，请检查日志。")
+
+    run_dir = detect_newest_dir(before)
+    if run_dir is None:
+        raise RuntimeError("知乎回答抓取完成，但未找到输出目录。")
+
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"知乎问题回答抓取完成：{question_url}",
+        stage="已完成",
+        progress=100,
+    )
+
+
+def run_zhihu_search_job(task_id: str, keyword: str, cookie: str, user_agent: str, headless: bool) -> None:
+    before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
+    cmd = [sys.executable, "zhihu_search_keyword_500.py", "--keyword", keyword, "--cookie", cookie]
+    if user_agent:
+        cmd.extend(["--user-agent", user_agent])
+    if headless:
+        cmd.append("--headless")
+    code = run_command_stream(task_id, cmd, "正在抓取知乎搜索结果", 5)
+    if code != 0:
+        raise RuntimeError("知乎搜索抓取失败，请检查日志。")
+
+    run_dir = detect_newest_dir(before)
+    if run_dir is None:
+        raise RuntimeError("知乎搜索抓取完成，但未找到输出目录。")
+
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"知乎搜索抓取完成：{keyword}",
+        stage="已完成",
+        progress=100,
+    )
+
+
 def worker(task_id: str) -> None:
     update_task(task_id, status="running", stage="准备启动", progress=2)
     try:
@@ -1172,6 +1248,22 @@ def worker(task_id: str) -> None:
             )
         elif task["type"] == "user_following":
             run_user_following_job(task_id, params["user_url"], params["state"], params["headless"])
+        elif task["type"] == "zhihu_question":
+            run_zhihu_question_job(
+                task_id,
+                params["question_url"],
+                params["cookie"],
+                params.get("user_agent", ""),
+                params["headless"],
+            )
+        elif task["type"] == "zhihu_search":
+            run_zhihu_search_job(
+                task_id,
+                params["keyword"],
+                params["cookie"],
+                params.get("user_agent", ""),
+                params["headless"],
+            )
         else:
             run_email_job(task_id, params)
         with TASKS_LOCK:
@@ -1206,6 +1298,8 @@ def start_task(task_type: str, params: Dict) -> str:
 
 
 def render_page() -> str:
+    safe_cookie = html.escape(DEFAULT_ZHIHU_COOKIE)
+    safe_user_agent = html.escape(DEFAULT_ZHIHU_USER_AGENT)
     return """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1648,6 +1742,46 @@ def render_page() -> str:
           <button class="btn alt" type="submit">开始抓取关注列表</button>
         </form>
 
+        <form class="panel js-task-form" data-kind="zhihu_question">
+          <h2>抓取知乎问题的所有回答全文</h2>
+          <p>输入 `zhihu.com/question/...` 问题链接，粘贴浏览器请求头里的 Cookie，系统会滚动问题页收集回答链接，再逐条进入回答页保存完整文本。</p>
+          <label>问题链接
+            <input type="text" name="question_url" placeholder="https://www.zhihu.com/question/547768388" required />
+          </label>
+          <label>Cookie 字符串
+            <textarea name="cookie" placeholder="把浏览器 Network 里该请求的完整 Cookie 头粘贴到这里" required>__DEFAULT_ZHIHU_COOKIE__</textarea>
+          </label>
+          <label>User-Agent
+            <input type="text" name="user_agent" value="__DEFAULT_ZHIHU_USER_AGENT__" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="headless" value="1" checked />
+            <span>无头模式运行</span>
+          </label>
+          <div class="mini-note">当前实现依赖有效的知乎 Cookie。输出目录会包含 `results.json`、`results.csv`、`all_answers.md` 和 `article.html`。</div>
+          <button class="btn" type="submit">开始抓取知乎回答</button>
+        </form>
+
+        <form class="panel js-task-form" data-kind="zhihu_search">
+          <h2>抓取知乎搜索前 500 条结果全文</h2>
+          <p>输入关键词后，系统会先在知乎搜索页抓取前 500 条内容结果的摘要和链接保存到 `results_stage1.json`，再逐条打开链接补全正文保存到 `results.json`。</p>
+          <label>搜索关键词
+            <input type="text" name="keyword" placeholder="例如 自动驾驶强化学习 / AI Agent" required />
+          </label>
+          <label>Cookie 字符串
+            <textarea name="cookie" placeholder="把浏览器 Network 里知乎请求的完整 Cookie 头粘贴到这里" required>__DEFAULT_ZHIHU_COOKIE__</textarea>
+          </label>
+          <label>User-Agent
+            <input type="text" name="user_agent" value="__DEFAULT_ZHIHU_USER_AGENT__" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="headless" value="1" checked />
+            <span>无头模式运行</span>
+          </label>
+          <div class="mini-note">输出目录会包含 `results_stage1.json`、`results.json`、`results.csv`、`all_results.md`、`fulltext_progress.json` 和 `article.html`。</div>
+          <button class="btn alt" type="submit">开始抓取知乎搜索</button>
+        </form>
+
         <section class="panel">
           <h2>一键批量发邮件</h2>
           <p>把已生成的报告作为附件，按收件人列表逐封发送。适合把结果直接推给客户、团队或订阅用户。</p>
@@ -2082,7 +2216,9 @@ def render_page() -> str:
         keyword: "/api/tasks/keyword",
         following: "/api/tasks/following",
         user_timeline: "/api/tasks/user-timeline",
-        user_following: "/api/tasks/user-following"
+        user_following: "/api/tasks/user-following",
+        zhihu_question: "/api/tasks/zhihu-question",
+        zhihu_search: "/api/tasks/zhihu-search"
       };
       const endpoint = endpointMap[kind];
       const button = form.querySelector("button[type='submit']");
@@ -2260,7 +2396,9 @@ def render_page() -> str:
     setIdleView();
   </script>
 </body>
-</html>"""
+</html>""".replace("__DEFAULT_ZHIHU_COOKIE__", safe_cookie).replace(
+        "__DEFAULT_ZHIHU_USER_AGENT__", safe_user_agent
+    )
 
 
 @app.get("/")
@@ -2392,6 +2530,46 @@ def api_task_user_following():
         {
             "user_url": user_url,
             "state": (request.form.get("state") or DEFAULT_STATE).strip(),
+            "headless": request.form.get("headless") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/zhihu-question")
+def api_task_zhihu_question():
+    question_url = (request.form.get("question_url") or "").strip()
+    cookie = (request.form.get("cookie") or "").strip()
+    if not question_url:
+        return jsonify({"error": "知乎问题链接不能为空。"}), 400
+    if not cookie:
+        return jsonify({"error": "Cookie 不能为空。"}), 400
+    task_id = start_task(
+        "zhihu_question",
+        {
+            "question_url": question_url,
+            "cookie": cookie,
+            "user_agent": (request.form.get("user_agent") or "").strip(),
+            "headless": request.form.get("headless") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/zhihu-search")
+def api_task_zhihu_search():
+    keyword = (request.form.get("keyword") or "").strip()
+    cookie = (request.form.get("cookie") or "").strip()
+    if not keyword:
+        return jsonify({"error": "知乎搜索关键词不能为空。"}), 400
+    if not cookie:
+        return jsonify({"error": "Cookie 不能为空。"}), 400
+    task_id = start_task(
+        "zhihu_search",
+        {
+            "keyword": keyword,
+            "cookie": cookie,
+            "user_agent": (request.form.get("user_agent") or "").strip(),
             "headless": request.form.get("headless") == "1",
         },
     )
