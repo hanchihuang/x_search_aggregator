@@ -138,6 +138,7 @@ python web_app.py
 - 输入任意 `x.com` 博主主页，抓取其关注用户列表，并生成详细画像报告
 - 输入任意 `zhihu.com/question/...` 问题链接，粘贴浏览器请求头里的 Cookie，抓取全部回答全文
 - 输入知乎搜索关键词，粘贴浏览器请求头里的 Cookie，抓取前 500 条搜索结果并保存两阶段文件
+- 输入小红书博主主页链接；若填写小红书 Cookie，则继续抓正文、全部图片和评论
 - 异步查看任务进度、实时日志、最近新增条数、已抓取条数、滚动轮次
 - 在页面里查看最近生成的输出目录、切换历史任务、停止运行中的任务
 - 页面关闭或服务重启后，任务状态会从磁盘恢复
@@ -218,6 +219,16 @@ python zhihu_search_keyword_500.py \
 ```
 
 > 第一阶段会保存 `results_stage1.json`，包含摘要和链接；第二阶段会逐条打开详情页并保存到 `results.json`、`results.csv`、`all_results.md`、`fulltext_progress.json` 和 `article.html`。
+
+#### 📕 爬取小红书博主全部笔记并补正文 / 图片 / 评论
+
+```bash
+python xiaohongshu_user_notes.py \
+  --user-url "https://www.xiaohongshu.com/user/profile/..." \
+  --cookie "<从浏览器 Network 请求头复制的小红书 Cookie>"
+```
+
+> 第一阶段会滚动主页，保存全部笔记卡片到 `results_stage1.json`。填写有效的小红书 Cookie 后，第二阶段会逐条打开详情，抓正文、全部图片和评论，并保存到 `results.json`、`comments.json`、`results.csv`、`all_notes.md`、`fulltext_progress.json` 和 `article.html`。
 
 #### 🧩 对已有结果补全全文
 
@@ -304,6 +315,20 @@ output/zhihu_search_<keyword>_500_<timestamp>/
 ├── all_results.md            # 全文 Markdown
 ├── fulltext_progress.json    # 全文补全过程进度
 ├── failed_details.json       # 打开详情页失败的记录
+└── article.html              # 浏览器可读页面
+```
+
+**小红书博主两阶段输出**：
+
+```
+output/xiaohongshu_user_<profile_id>_<timestamp>/
+├── results_stage1.json       # 第一阶段：全部笔记卡片摘要
+├── results.json              # 第二阶段：正文、图片、评论补全结果
+├── comments.json             # 仅评论结构化结果
+├── results.csv               # 结果表格
+├── all_notes.md              # 全量 Markdown
+├── fulltext_progress.json    # 第二阶段进度
+├── failed_details.json       # 详情抓取失败记录
 └── article.html              # 浏览器可读页面
 ```
 
@@ -414,6 +439,7 @@ output/following_vista8_20260306/
 - 博主关注列表抓取：提交后后台异步执行 `crawl_user_following.py`
 - 知乎问题回答全文：提交后后台异步执行 `zhihu_question_answers.py`
 - 知乎搜索前 500 条全文：提交后后台异步执行 `zhihu_search_keyword_500.py`
+- 小红书博主全部笔记：先抓全部图文卡片；填写 Cookie 后继续抓正文、全部图片和评论
 - 多任务队列：可切换查看历史任务、运行中任务、失败任务
 - 实时进度：显示目标条数、已抓取条数、滚动轮次、最近新增条数
 - 停止任务：可终止当前运行中的抓取子进程
