@@ -117,8 +117,8 @@ def hydrate_items_with_fulltext(
     delay_ms: int = 1200,
     logger: Optional[Callable[[str], None]] = None,
 ) -> List[Dict]:
-    page = context.new_page()
     total = len(items)
+    max_attempts = 3
     progress = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -146,29 +146,46 @@ def hydrate_items_with_fulltext(
         if logger:
             logger(f"[FULLTEXT] {index}/{total} {tweet_id}")
 
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(delay_ms)
-            full_text = extract_full_text_from_page(page, tweet_id)
-            previous_text = str(item.get("text") or "").strip()
-            if previous_text and not item.get("card_text"):
-                item["card_text"] = previous_text
-            if full_text:
-                item["full_text"] = full_text
-                item["text"] = full_text
-                item["full_text_status"] = "ok"
-                item["full_text_fetched_at"] = datetime.now(timezone.utc).isoformat()
-                progress["hydrated"] += 1
-            else:
-                item["full_text"] = previous_text
-                item["full_text_status"] = "empty"
-                progress["failed"] += 1
-        except Exception as exc:
-            item["full_text"] = str(item.get("text") or "")
-            item["full_text_status"] = f"error: {exc}"
+        previous_text = str(item.get("text") or "").strip()
+        if previous_text and not item.get("card_text"):
+            item["card_text"] = previous_text
+
+        last_error = ""
+        full_text = ""
+        for attempt in range(1, max_attempts + 1):
+            page = context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                page.wait_for_timeout(delay_ms)
+                full_text = extract_full_text_from_page(page, tweet_id)
+                if full_text:
+                    break
+                last_error = "empty"
+            except Exception as exc:
+                last_error = str(exc)
+                if logger:
+                    logger(f"[FULLTEXT][WARN] {tweet_id} attempt {attempt}/{max_attempts}: {exc}")
+                try:
+                    page.goto("about:blank", wait_until="load", timeout=5000)
+                except Exception:
+                    pass
+                if attempt < max_attempts:
+                    page.wait_for_timeout(delay_ms * attempt)
+            finally:
+                page.close()
+
+        if full_text:
+            item["full_text"] = full_text
+            item["text"] = full_text
+            item["full_text_status"] = "ok"
+            item["full_text_fetched_at"] = datetime.now(timezone.utc).isoformat()
+            progress["hydrated"] += 1
+        else:
+            item["full_text"] = previous_text
+            item["full_text_status"] = "empty" if last_error == "empty" else f"error: {last_error}"
             progress["failed"] += 1
-            if logger:
-                logger(f"[FULLTEXT][ERROR] {tweet_id}: {exc}")
+            if logger and last_error and last_error != "empty":
+                logger(f"[FULLTEXT][ERROR] {tweet_id}: {last_error}")
 
         progress["processed"] += 1
         progress["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -176,5 +193,4 @@ def hydrate_items_with_fulltext(
         if index % max(1, checkpoint_every) == 0 or index == total:
             _write_checkpoint(run_dir, items, progress, raw_name, final_name)
 
-    page.close()
     return items

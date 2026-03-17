@@ -21,6 +21,7 @@ from search_x import (
     HASHTAG_RE,
     MENTION_RE,
     TWEET_SELECTORS,
+    close_context,
     create_context,
     extract_tweet,
     get_cards,
@@ -54,6 +55,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-fulltext", action="store_true", help="Skip stage-2 hydration from tweet detail pages")
     p.add_argument("--fulltext-delay-ms", type=int, default=1200, help="Pause after opening each tweet detail page")
     p.add_argument("--fulltext-checkpoint-every", type=int, default=10, help="Write hydration checkpoint every N tweets")
+    p.add_argument("--cdp-url", default="", help="Existing Chrome CDP endpoint, e.g. http://127.0.0.1:9222")
+    p.add_argument("--auto-launch", action="store_true", help="Auto launch Chrome with remote debugging when CDP is unavailable")
+    p.add_argument("--chrome-path", default="/usr/bin/google-chrome", help="Chrome executable path for auto-launch")
+    p.add_argument("--user-data-dir", default="chrome_profile", help="Chrome profile dir used for auto-launch")
+    p.add_argument("--wait-seconds", type=int, default=20, help="Seconds to wait for CDP readiness after auto-launch")
     return p.parse_args()
 
 
@@ -411,6 +417,7 @@ def write_csv(path: Path, items: List[Dict]) -> None:
         "text",
         "full_text",
         "full_text_status",
+        "full_text_fetched_at",
         "reply_count",
         "retweet_count",
         "like_count",
@@ -544,14 +551,25 @@ def main() -> None:
     print(f"Timeline URL: {target_url}")
 
     with sync_playwright() as p:
-        context = create_context(p, args.state, args.headless)
+        if args.cdp_url:
+            print(f"Using existing Chrome via CDP: {args.cdp_url}")
+        context = create_context(
+            p,
+            args.state,
+            args.headless,
+            cdp_url=args.cdp_url,
+            auto_launch=args.auto_launch,
+            chrome_path=args.chrome_path,
+            user_data_dir=args.user_data_dir,
+            wait_seconds=args.wait_seconds,
+        )
         page = context.new_page()
         page.goto(target_url, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
 
         if not validate_auth_state(page):
             print("Authentication issue detected. Please refresh login state with login_x.py.")
-            context.close()
+            close_context(context)
             return
 
         if not wait_for_timeline(page):
@@ -568,7 +586,7 @@ def main() -> None:
             scroll_pause=args.scroll_pause,
             checkpoint_cb=make_user_timeline_checkpoint_callback(run_dir, handle),
         )
-        context.close()
+        close_context(context)
 
     if not items:
         print("Warning: No tweets were collected.")
@@ -583,7 +601,16 @@ def main() -> None:
 
         print("Stage 2: hydrating full text from tweet detail pages...")
         with sync_playwright() as p:
-            context = create_context(p, args.state, args.headless)
+            context = create_context(
+                p,
+                args.state,
+                args.headless,
+                cdp_url=args.cdp_url,
+                auto_launch=args.auto_launch,
+                chrome_path=args.chrome_path,
+                user_data_dir=args.user_data_dir,
+                wait_seconds=args.wait_seconds,
+            )
             items = hydrate_items_with_fulltext(
                 context=context,
                 items=items,
@@ -592,7 +619,7 @@ def main() -> None:
                 delay_ms=args.fulltext_delay_ms,
                 logger=print,
             )
-            context.close()
+            close_context(context)
 
     summary = summarize(items, f"@{handle} history")
     detailed = build_detailed_analysis(items, handle)

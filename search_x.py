@@ -6,13 +6,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
+import subprocess
 import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
+from urllib.error import URLError
 from urllib.parse import quote
+from urllib.request import ProxyHandler, build_opener
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright, TimeoutError
 
@@ -628,7 +632,68 @@ def write_summary_md(path: Path, summary: Dict) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def create_context(playwright, state: str, headless: bool) -> BrowserContext:
+def cdp_ready(cdp_url: str) -> bool:
+    version_url = f"{cdp_url.rstrip('/')}/json/version"
+    try:
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(version_url, timeout=1.5) as resp:
+            return resp.status == 200
+    except URLError:
+        return False
+    except Exception:
+        return False
+
+
+def parse_cdp_port(cdp_url: str) -> int:
+    return int(cdp_url.rstrip("/").split(":")[-1])
+
+
+def launch_chrome_for_cdp(chrome_path: str, user_data_dir: Path, cdp_port: int):
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        chrome_path,
+        f"--remote-debugging-port={cdp_port}",
+        "--remote-debugging-address=127.0.0.1",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "https://x.com/home",
+    ]
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        cmd.insert(-1, "--headless=new")
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def can_connect_over_cdp(playwright, cdp_url: str) -> bool:
+    try:
+        browser = playwright.chromium.connect_over_cdp(cdp_url, timeout=3000)
+        browser.close()
+        return True
+    except Exception:
+        return False
+
+
+def wait_cdp_ready(playwright, cdp_url: str, wait_seconds: int) -> bool:
+    for _ in range(max(1, wait_seconds * 2)):
+        if cdp_ready(cdp_url) or can_connect_over_cdp(playwright, cdp_url):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def create_context(
+    playwright,
+    state: str,
+    headless: bool,
+    cdp_url: str = "",
+    auto_launch: bool = False,
+    chrome_path: str = "/usr/bin/google-chrome",
+    user_data_dir: str = "chrome_profile",
+    wait_seconds: int = 20,
+) -> BrowserContext:
     # Import browser config for better fingerprinting
     try:
         from browser_config import get_browser_args, get_context_options
@@ -638,20 +703,57 @@ def create_context(playwright, state: str, headless: bool) -> BrowserContext:
         launch_args = []
         context_options = {}
     
-    browser = playwright.chromium.launch(
-        headless=headless,
-        args=launch_args
-    )
+    if cdp_url:
+        if not cdp_ready(cdp_url):
+            if not auto_launch:
+                raise RuntimeError(
+                    "CDP endpoint is not reachable. Start Chrome with remote debugging or enable auto-launch."
+                )
+            cdp_port = parse_cdp_port(cdp_url)
+            chrome_proc = launch_chrome_for_cdp(
+                chrome_path=chrome_path,
+                user_data_dir=Path(user_data_dir).expanduser().resolve(),
+                cdp_port=cdp_port,
+            )
+            if not wait_cdp_ready(playwright, cdp_url, wait_seconds):
+                stderr = "(empty)"
+                if chrome_proc.stderr and chrome_proc.poll() is not None:
+                    stderr = chrome_proc.stderr.read().strip() or "(empty)"
+                raise RuntimeError(
+                    f"CDP endpoint did not become ready within {wait_seconds}s.\nChrome stderr:\n{stderr}"
+                )
+        browser = playwright.chromium.connect_over_cdp(cdp_url)
+        context = browser.new_context(**context_options)
+        setattr(context, "_attached_browser", browser)
+        return context
+
+    browser = playwright.chromium.launch(headless=headless, args=launch_args)
     state_path = Path(state)
 
     if state_path.exists():
         context_options["storage_state"] = str(state_path)
-        return browser.new_context(**context_options)
+        context = browser.new_context(**context_options)
+        setattr(context, "_attached_browser", browser)
+        return context
 
     print(
         f"[Warn] storage state not found: {state_path}. Continuing without login state."
     )
-    return browser.new_context(**context_options)
+    context = browser.new_context(**context_options)
+    setattr(context, "_attached_browser", browser)
+    return context
+
+
+def close_context(context: BrowserContext) -> None:
+    browser = getattr(context, "_attached_browser", None)
+    try:
+        context.close()
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 def validate_auth_state(page: Page) -> bool:
