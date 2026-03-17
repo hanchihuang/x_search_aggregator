@@ -5,7 +5,7 @@
 <h1 align="center">Social Radar</h1>
 
 <p align="center">
-  Turn X / Zhihu / Xiaohongshu into ranked HTML intelligence reports.<br />
+  Turn X / Folo / Zhihu / Xiaohongshu into ranked HTML intelligence reports.<br />
   No official API. Local-first. One web console.
 </p>
 
@@ -25,6 +25,7 @@ Social Radar turns noisy public content into something you can actually read and
 - Crawl your following timeline and rank posts by usefulness
 - Pull full answers from Zhihu questions or keyword results
 - Pull Xiaohongshu note lists, full text, images, and comments
+- Pull Folo timeline data with your own cookie inside the same web console
 - Track progress in a local web console instead of staring at terminal logs
 - Persist tasks locally so history survives page refreshes and service restarts
 - Highlight the most actionable efficiency posts and the most research-inspiring AI posts
@@ -97,7 +98,7 @@ http://127.0.0.1:8080
 
 1. Run `python web_app.py`
 2. Open the browser console
-3. Enter an X keyword
+3. Enter an X keyword, or use the Folo panel
 4. Start a `Top 500` search
 5. Wait for the report to finish
 6. Open the generated HTML output
@@ -158,6 +159,26 @@ python xiaohongshu_search_keyword_500.py \
   --cookie "<your cookie>"
 ```
 
+### 6. Folo timeline summary
+
+You can run this from the same `http://127.0.0.1:8080` web console.
+
+The new Folo panel supports:
+
+- paste your own Folo cookie
+- choose `Articles / Social / Pictures / Videos`
+- generate `summary.html` and `article.html`
+- auto-curate:
+  - `超级提高效率最优帮助`
+  - `对 AI 研究最有启发`
+- attach Chinese recommendation reasons to every highlighted item
+
+CLI entry is also available:
+
+```bash
+python folo_fetch.py --cookie "<your cookie>" --view 0 --limit 20
+```
+
 ## Web console features
 
 The local console in `web_app.py` is the main product surface.
@@ -168,6 +189,7 @@ The local console in `web_app.py` is the main product surface.
 - open generated HTML directly
 - stop running tasks
 - persist task metadata to disk
+- run Folo timeline fetches from the same dashboard
 
 ## Ranking page extras
 
@@ -198,6 +220,7 @@ For a repo like this, the console matters more than the crawler scripts. People 
 ├── zhihu_search_keyword_500.py
 ├── xiaohongshu_search_keyword_500.py
 ├── xiaohongshu_user_notes.py
+├── folo_fetch.py
 ├── rank_usefulness.py
 ├── html_report.py
 └── assets/
@@ -218,7 +241,7 @@ Keeping that positioning narrow is important. Narrow tools spread better.
 ## Known constraints
 
 - X flows depend on a valid logged-in browser session
-- Zhihu and Xiaohongshu flows require user-provided cookies
+- Folo / Zhihu / Xiaohongshu flows require user-provided cookies
 - UI and scripts were optimized for practical output, not anti-fragile scraping at massive scale
 - Some platform pages will still break when upstream HTML changes
 

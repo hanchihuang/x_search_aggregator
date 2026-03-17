@@ -83,8 +83,10 @@ MAILER_LOCK = threading.Lock()
 
 def sanitize_task_params(task_type: str, params: Dict) -> Dict:
     payload = dict(params or {})
-    if task_type in {"zhihu_question", "zhihu_search", "xiaohongshu_user", "xiaohongshu_search"} and payload.get("cookie"):
+    if task_type in {"zhihu_question", "zhihu_search", "xiaohongshu_user", "xiaohongshu_search", "folo"} and payload.get("cookie"):
         payload["cookie"] = "[hidden]"
+    if task_type == "x_zhihu_search" and payload.get("zhihu_cookie"):
+        payload["zhihu_cookie"] = "[hidden]"
     return payload
 
 
@@ -531,6 +533,30 @@ def run_report_files(run_dir: Path) -> List[Dict]:
                     "url": f"/files/{rel}",
                 }
             )
+    manifest_path = run_dir / "combined_manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+        for child in manifest.get("children", []):
+            for link in child.get("links", []):
+                rel_path = str(link.get("path", "")).strip()
+                label = str(link.get("label", "")).strip()
+                if not rel_path or not label:
+                    continue
+                path = BASE_DIR / rel_path
+                if not path.exists():
+                    continue
+                rel = path.relative_to(BASE_DIR).as_posix()
+                items.append(
+                    {
+                        "label": label,
+                        "name": path.name,
+                        "path": str(path),
+                        "url": f"/files/{rel}",
+                    }
+                )
     return items
 
 
@@ -709,6 +735,105 @@ def detect_newest_dir(before: set[str]) -> Path | None:
         return OUTPUT_DIR / created[-1]
     candidates = list_run_dirs(limit=1)
     return candidates[0] if candidates else None
+
+
+def create_combined_run_dir(prefix: str, keyword: str) -> Path:
+    safe_keyword = re.sub(r"\s+", "_", keyword.strip())
+    safe_keyword = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "", safe_keyword)[:60] or "keyword"
+    run_dir = OUTPUT_DIR / f"{prefix}_{safe_keyword}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def relative_output_path(path: Path) -> str:
+    return path.resolve().relative_to(BASE_DIR.resolve()).as_posix()
+
+
+def write_combined_search_outputs(run_dir: Path, keyword: str, x_run_dir: Path, zhihu_run_dir: Path) -> None:
+    children = []
+    for engine, child_dir in [("X", x_run_dir), ("知乎", zhihu_run_dir)]:
+        links = []
+        for item in run_report_files(child_dir):
+            links.append(
+                {
+                    "label": f"{engine} · {item['label']}",
+                    "path": relative_output_path(Path(item["path"])),
+                }
+            )
+        children.append(
+            {
+                "engine": engine,
+                "run_dir": child_dir.name,
+                "path": relative_output_path(child_dir),
+                "links": links,
+            }
+        )
+    manifest = {
+        "keyword": keyword,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "children": children,
+    }
+    (run_dir / "combined_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary_lines = [
+        f"# 联合搜索结果 - {keyword}",
+        "",
+        f"- 关键词: {keyword}",
+        f"- X 输出目录: {x_run_dir.name}",
+        f"- 知乎输出目录: {zhihu_run_dir.name}",
+        "",
+    ]
+    for child in children:
+        summary_lines.append(f"## {child['engine']}")
+        summary_lines.append("")
+        summary_lines.append(f"- 输出目录: {child['run_dir']}")
+        for link in child["links"]:
+            summary_lines.append(f"- {link['label']}")
+        summary_lines.append("")
+    (run_dir / "summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
+    card_html = []
+    for child in children:
+        links_html = "".join(
+            f'<li><a href="/files/{html.escape(link["path"])}" target="_blank" rel="noreferrer">{html.escape(link["label"])}</a></li>'
+            for link in child["links"]
+        )
+        card_html.append(
+            f"""
+            <article class="card">
+              <h2>{html.escape(child['engine'])}</h2>
+              <p>输出目录：<code>{html.escape(child['run_dir'])}</code></p>
+              <ul>{links_html}</ul>
+            </article>
+            """
+        )
+    article = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{html.escape(keyword)} - X + 知乎联合搜索</title>
+  <style>
+    body {{ margin: 0; font-family: "IBM Plex Sans","PingFang SC","Noto Sans SC",sans-serif; background: #f3efe8; color: #1d1a16; }}
+    .wrap {{ max-width: 980px; margin: 0 auto; padding: 28px 18px 48px; }}
+    .hero, .card {{ background: rgba(255,255,255,0.88); border: 1px solid #d7cdbd; border-radius: 22px; box-shadow: 0 18px 44px rgba(39,28,20,0.08); }}
+    .hero {{ padding: 24px; margin-bottom: 16px; }}
+    .card {{ padding: 18px; margin-bottom: 14px; }}
+    h1 {{ margin: 0 0 8px; font-family: "Source Han Serif SC","Noto Serif CJK SC",serif; }}
+    h2 {{ margin: 0 0 10px; }}
+    p, li {{ line-height: 1.7; }}
+    a {{ color: #0f766e; }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <h1>{html.escape(keyword)}</h1>
+      <p>已完成 X.com 与知乎的联合关键词搜索。下面可直接打开两边各自的结果页面和数据文件。</p>
+    </section>
+    {''.join(card_html)}
+  </main>
+</body>
+</html>"""
+    (run_dir / "article.html").write_text(article, encoding="utf-8")
 
 
 def recent_runs_payload() -> List[Dict]:
@@ -1146,13 +1271,25 @@ def run_following_job(task_id: str, state: str, headless: bool, hydrate_fulltext
     )
 
 
-def run_user_timeline_job(task_id: str, user_url: str, state: str, headless: bool, hydrate_fulltext: bool) -> None:
+def run_user_timeline_job(
+    task_id: str,
+    user_url: str,
+    state: str,
+    headless: bool,
+    hydrate_fulltext: bool,
+    cdp_url: str = "",
+    auto_launch: bool = False,
+) -> None:
     before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
     cmd = [sys.executable, "crawl_user_timeline.py", "--user-url", user_url, "--state", state, "--max-items", "0"]
     if not hydrate_fulltext:
         cmd.append("--skip-fulltext")
     if headless:
         cmd.append("--headless")
+    if cdp_url:
+        cmd.extend(["--cdp-url", cdp_url])
+    if auto_launch:
+        cmd.append("--auto-launch")
     code = run_command_stream(task_id, cmd, "正在抓取博主历史推文", 5)
     if code != 0:
         raise RuntimeError("博主历史推文抓取失败，请检查日志。")
@@ -1244,6 +1381,63 @@ def run_zhihu_search_job(task_id: str, keyword: str, cookie: str, user_agent: st
     )
 
 
+def run_x_zhihu_search_job(
+    task_id: str,
+    keyword: str,
+    lang: str,
+    state: str,
+    hydrate_fulltext: bool,
+    zhihu_cookie: str,
+    zhihu_user_agent: str,
+    headless: bool,
+) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    combined_dir = create_combined_run_dir("x_zhihu_search", keyword)
+    update_task(task_id, result_dir=str(combined_dir), stage="正在抓取 X 关键词", progress=3)
+
+    before_x = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()}
+    x_cmd = [sys.executable, "search_keyword_500.py", "--keyword", keyword, "--state", state]
+    if lang:
+        x_cmd.extend(["--lang", lang])
+    if not hydrate_fulltext:
+        x_cmd.append("--skip-fulltext")
+    if headless:
+        x_cmd.append("--headless")
+    code = run_command_stream(task_id, x_cmd, "正在抓取 X 关键词", 5)
+    if code != 0:
+        raise RuntimeError("X 关键词抓取失败，请检查日志。")
+    x_run_dir = detect_newest_dir(before_x)
+    if x_run_dir is None:
+        raise RuntimeError("X 关键词抓取完成，但未找到输出目录。")
+    update_task(task_id, result_dir=str(combined_dir), stage="正在为 X 结果生成排序页", progress=42)
+    code = run_command_stream(task_id, [sys.executable, "rank_usefulness.py", "--input", str(x_run_dir)], "正在为 X 结果生成排序页", 44)
+    if code != 0:
+        raise RuntimeError("X 关键词评分失败，请检查日志。")
+
+    before_zh = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()}
+    zh_cmd = [sys.executable, "zhihu_search_keyword_500.py", "--keyword", keyword, "--cookie", zhihu_cookie]
+    if zhihu_user_agent:
+        zh_cmd.extend(["--user-agent", zhihu_user_agent])
+    if headless:
+        zh_cmd.append("--headless")
+    code = run_command_stream(task_id, zh_cmd, "正在抓取知乎关键词", 52)
+    if code != 0:
+        raise RuntimeError("知乎搜索抓取失败，请检查日志。")
+    zh_run_dir = detect_newest_dir(before_zh)
+    if zh_run_dir is None:
+        raise RuntimeError("知乎搜索抓取完成，但未找到输出目录。")
+
+    update_task(task_id, result_dir=str(combined_dir), stage="正在生成联合总览页", progress=92)
+    write_combined_search_outputs(combined_dir, keyword, x_run_dir, zh_run_dir)
+    update_task(
+        task_id,
+        result_dir=str(combined_dir),
+        message=f"联合搜索完成：{keyword}",
+        stage="已完成",
+        progress=100,
+    )
+
+
 def run_xiaohongshu_user_job(task_id: str, user_url: str, cookie: str, headless: bool) -> None:
     before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
     cmd = [sys.executable, "xiaohongshu_user_notes.py", "--user-url", user_url]
@@ -1292,6 +1486,35 @@ def run_xiaohongshu_search_job(task_id: str, keyword: str, cookie: str, user_age
     )
 
 
+def run_folo_job(task_id: str, cookie: str, view: int, limit: int) -> None:
+    before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
+    cmd = [
+        sys.executable,
+        "folo_fetch.py",
+        "--cookie",
+        cookie,
+        "--view",
+        str(view),
+        "--limit",
+        str(limit),
+    ]
+    code = run_command_stream(task_id, cmd, "正在抓取 Folo 时间线", 5)
+    if code != 0:
+        raise RuntimeError("Folo 抓取失败，请检查日志。")
+
+    run_dir = detect_newest_dir(before)
+    if run_dir is None:
+        raise RuntimeError("Folo 抓取完成，但未找到输出目录。")
+
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"Folo 抓取完成：view={view}，limit={limit}",
+        stage="已完成",
+        progress=100,
+    )
+
+
 def worker(task_id: str) -> None:
     update_task(task_id, status="running", stage="准备启动", progress=2)
     try:
@@ -1306,7 +1529,13 @@ def worker(task_id: str) -> None:
             run_following_job(task_id, params["state"], params["headless"], params.get("hydrate_fulltext", True))
         elif task["type"] == "user_timeline":
             run_user_timeline_job(
-                task_id, params["user_url"], params["state"], params["headless"], params.get("hydrate_fulltext", True)
+                task_id,
+                params["user_url"],
+                params["state"],
+                params["headless"],
+                params.get("hydrate_fulltext", True),
+                params.get("cdp_url", ""),
+                params.get("auto_launch", False),
             )
         elif task["type"] == "user_following":
             run_user_following_job(task_id, params["user_url"], params["state"], params["headless"])
@@ -1326,6 +1555,17 @@ def worker(task_id: str) -> None:
                 params.get("user_agent", ""),
                 params["headless"],
             )
+        elif task["type"] == "x_zhihu_search":
+            run_x_zhihu_search_job(
+                task_id,
+                params["keyword"],
+                params.get("lang", ""),
+                params["state"],
+                params.get("hydrate_fulltext", True),
+                params["zhihu_cookie"],
+                params.get("zhihu_user_agent", ""),
+                params["headless"],
+            )
         elif task["type"] == "xiaohongshu_user":
             run_xiaohongshu_user_job(task_id, params["user_url"], params.get("cookie", ""), params["headless"])
         elif task["type"] == "xiaohongshu_search":
@@ -1335,6 +1575,13 @@ def worker(task_id: str) -> None:
                 params["cookie"],
                 params.get("user_agent", ""),
                 params["headless"],
+            )
+        elif task["type"] == "folo":
+            run_folo_job(
+                task_id,
+                params["cookie"],
+                int(params.get("view", 0)),
+                int(params.get("limit", 20)),
             )
         else:
             run_email_job(task_id, params)
@@ -1731,7 +1978,7 @@ def render_page() -> str:
 <body>
   <main class="wrap">
     <header class="hero">
-      <h1>X 抓取控制台</h1>
+      <h1>X / Folo 抓取控制台</h1>
       <p>提交任务后会在后台执行。右侧面板会自动刷新状态、进度和日志，完成后直接点开生成的 HTML。</p>
     </header>
 
@@ -1761,6 +2008,36 @@ def render_page() -> str:
           <button class="btn" type="submit">开始抓取关键词</button>
         </form>
 
+        <form class="panel js-task-form" data-kind="x_zhihu_search">
+          <h2>按关键词同时抓取 X.com 和知乎</h2>
+          <p>输入同一个关键词后，系统会先抓取 X.com 最新 500 条并生成排序页，再抓取知乎搜索结果前 500 条全文，最后生成一个联合总览页。</p>
+          <label>关键词
+            <input type="text" name="keyword" placeholder="例如 AI Agent / 自动驾驶 / 信息差" required />
+          </label>
+          <label>X 语言过滤
+            <input type="text" name="lang" placeholder="可留空，或填 zh / en" />
+          </label>
+          <label>X 登录态文件
+            <input type="text" name="state" value="auth_state_cookie.json" />
+          </label>
+          <label>知乎 Cookie 字符串
+            <textarea name="zhihu_cookie" placeholder="把浏览器 Network 里知乎请求的完整 Cookie 头粘贴到这里" required>__DEFAULT_ZHIHU_COOKIE__</textarea>
+          </label>
+          <label>知乎 User-Agent
+            <input type="text" name="zhihu_user_agent" value="__DEFAULT_ZHIHU_USER_AGENT__" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="headless" value="1" checked />
+            <span>无头模式运行</span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="hydrate_fulltext" value="1" checked />
+            <span>X 逐条进入详情页补全文</span>
+          </label>
+          <div class="mini-note">最终会生成一个联合输出目录，里面包含总览页和 X / 知乎两个子任务的结果链接。</div>
+          <button class="btn alt" type="submit">开始联合搜索</button>
+        </form>
+
         <form class="panel js-task-form" data-kind="following">
           <h2>抓取关注流并生成 HTML</h2>
           <p>抓取你关注账号的最新动态，再自动生成排序页、摘要页和文章页。</p>
@@ -1779,6 +2056,27 @@ def render_page() -> str:
           <button class="btn alt" type="submit">开始抓取关注流</button>
         </form>
 
+        <form class="panel js-task-form" data-kind="folo">
+          <h2>抓取 Folo 时间线并生成摘要页</h2>
+          <p>粘贴你自己的 Folo Cookie，抓取时间线、输出摘要页和文章页，并附带“提效内容 / AI 研究启发”两块精选与中文推荐理由。</p>
+          <label>Folo Cookie
+            <textarea name="cookie" placeholder="粘贴完整 Cookie，仅用于你自己有权限访问的 Folo 账号数据" required></textarea>
+          </label>
+          <label>时间线视图
+            <select name="view">
+              <option value="0">Articles</option>
+              <option value="1">Social</option>
+              <option value="2">Pictures</option>
+              <option value="3">Videos</option>
+            </select>
+          </label>
+          <label>展示条数
+            <input type="text" name="limit" value="20" />
+          </label>
+          <div class="mini-note">输出目录会包含 `results.json`、`summary.json`、`summary.html` 和 `article.html`。</div>
+          <button class="btn alt" type="submit">开始抓取 Folo</button>
+        </form>
+
         <form class="panel js-task-form" data-kind="user_timeline">
           <h2>抓取某个博主全部历史推文</h2>
           <p>输入 `x.com` 用户主页，抓取该博主尽可能完整的历史推文，并生成文章页、详细报告和价值排序页。</p>
@@ -1788,9 +2086,16 @@ def render_page() -> str:
           <label>登录态文件
             <input type="text" name="state" value="auth_state_cookie.json" />
           </label>
+          <label>现有 Chrome CDP 地址
+            <input type="text" name="cdp_url" value="" placeholder="http://127.0.0.1:9222" />
+          </label>
           <label class="checkbox">
             <input type="checkbox" name="headless" value="1" checked />
             <span>无头模式运行</span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="auto_launch" value="1" />
+            <span>若 CDP 不可用则自动拉起 Chrome</span>
           </label>
           <label class="checkbox">
             <input type="checkbox" name="hydrate_fulltext" value="1" checked />
@@ -2325,13 +2630,15 @@ def render_page() -> str:
       const kind = form.dataset.kind;
       const endpointMap = {
         keyword: "/api/tasks/keyword",
+        x_zhihu_search: "/api/tasks/x-zhihu-search",
         following: "/api/tasks/following",
         user_timeline: "/api/tasks/user-timeline",
         user_following: "/api/tasks/user-following",
         zhihu_question: "/api/tasks/zhihu-question",
         zhihu_search: "/api/tasks/zhihu-search",
         xiaohongshu_user: "/api/tasks/xiaohongshu-user",
-        xiaohongshu_search: "/api/tasks/xiaohongshu-search"
+        xiaohongshu_search: "/api/tasks/xiaohongshu-search",
+        folo: "/api/tasks/folo"
       };
       const endpoint = endpointMap[kind];
       const button = form.querySelector("button[type='submit']");
@@ -2603,6 +2910,29 @@ def api_task_keyword():
     return jsonify({"task_id": task_id})
 
 
+@app.post("/api/tasks/x-zhihu-search")
+def api_task_x_zhihu_search():
+    keyword = (request.form.get("keyword") or "").strip()
+    zhihu_cookie = (request.form.get("zhihu_cookie") or "").strip()
+    if not keyword:
+        return jsonify({"error": "关键词不能为空。"}), 400
+    if not zhihu_cookie:
+        return jsonify({"error": "知乎 Cookie 不能为空。"}), 400
+    task_id = start_task(
+        "x_zhihu_search",
+        {
+            "keyword": keyword,
+            "lang": (request.form.get("lang") or "").strip(),
+            "state": (request.form.get("state") or DEFAULT_STATE).strip(),
+            "zhihu_cookie": zhihu_cookie,
+            "zhihu_user_agent": (request.form.get("zhihu_user_agent") or "").strip(),
+            "headless": request.form.get("headless") == "1",
+            "hydrate_fulltext": request.form.get("hydrate_fulltext") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
 @app.post("/api/tasks/following")
 def api_task_following():
     task_id = start_task(
@@ -2626,6 +2956,8 @@ def api_task_user_timeline():
         {
             "user_url": user_url,
             "state": (request.form.get("state") or DEFAULT_STATE).strip(),
+            "cdp_url": (request.form.get("cdp_url") or "").strip(),
+            "auto_launch": request.form.get("auto_launch") == "1",
             "headless": request.form.get("headless") == "1",
             "hydrate_fulltext": request.form.get("hydrate_fulltext") == "1",
         },
@@ -2720,6 +3052,30 @@ def api_task_xiaohongshu_search():
             "cookie": cookie,
             "user_agent": (request.form.get("user_agent") or "").strip(),
             "headless": request.form.get("headless") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/folo")
+def api_task_folo():
+    cookie = (request.form.get("cookie") or "").strip()
+    if not cookie:
+        return jsonify({"error": "Folo Cookie 不能为空。"}), 400
+    raw_view = (request.form.get("view") or "0").strip() or "0"
+    raw_limit = (request.form.get("limit") or "20").strip() or "20"
+    try:
+        view = int(raw_view)
+        limit = int(raw_limit)
+    except ValueError:
+        return jsonify({"error": "Folo view 和 limit 必须是整数。"}), 400
+    limit = max(5, min(100, limit))
+    task_id = start_task(
+        "folo",
+        {
+            "cookie": cookie,
+            "view": view,
+            "limit": limit,
         },
     )
     return jsonify({"task_id": task_id})
