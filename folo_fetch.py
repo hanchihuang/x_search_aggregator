@@ -169,6 +169,83 @@ def http_json(path: str, cookie: str, method: str = "GET", payload: dict[str, An
         return json.loads(resp.read().decode(charset))
 
 
+def extract_response_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def extract_next_cursor(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    candidates = [
+        payload.get("nextCursor"),
+        payload.get("cursor"),
+    ]
+    for key in ("paging", "pagination", "pageInfo", "meta"):
+        node = payload.get(key)
+        if isinstance(node, dict):
+            candidates.extend(
+                [
+                    node.get("nextCursor"),
+                    node.get("next_cursor"),
+                    node.get("cursor"),
+                    node.get("endCursor"),
+                    node.get("end_cursor"),
+                ]
+            )
+    for value in candidates:
+        if value not in (None, "", False):
+            return str(value)
+    return ""
+
+
+def fetch_entries(cookie: str, view: int, limit: int) -> list[dict[str, Any]]:
+    target = max(5, min(100, int(limit)))
+    items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    cursor = ""
+
+    for page_no in range(1, 9):
+        payload: dict[str, Any] = {
+            "view": view,
+            "limit": target,
+            "pageSize": target,
+            "perPage": target,
+            "take": target,
+        }
+        if cursor:
+            payload["cursor"] = cursor
+        resp = http_json("/entries", cookie, method="POST", payload=payload)
+        batch = extract_response_items(resp)
+        if not batch:
+            break
+
+        new_count = 0
+        for item in batch:
+            entry = item.get("entries", {}) if isinstance(item, dict) else {}
+            entry_id = str(entry.get("id") or item.get("id") or "").strip()
+            dedupe_key = entry_id or json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            items.append(item)
+            new_count += 1
+            if len(items) >= target:
+                return items[:target]
+
+        next_cursor = extract_next_cursor(resp)
+        if new_count == 0 or not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    return items[:target]
+
+
 def compact_entry(item: dict[str, Any]) -> dict[str, Any]:
     entry = item.get("entries", {}) or {}
     feed = item.get("feeds", {}) or {}
@@ -555,9 +632,8 @@ def main() -> None:
     print("开始抓取 Folo 数据...")
     session = http_json("/better-auth/get-session", args.cookie)
     subscriptions_resp = http_json("/subscriptions", args.cookie)
-    entries_resp = http_json("/entries", args.cookie, method="POST", payload={"view": view})
+    raw_entries = fetch_entries(args.cookie, view, limit)
     subscriptions = subscriptions_resp.get("data", []) if isinstance(subscriptions_resp, dict) else []
-    raw_entries = entries_resp.get("data", []) if isinstance(entries_resp, dict) else []
     entries = [compact_entry(item) for item in raw_entries[:limit]]
     translator = ZhTranslator()
     print("正在把标题和摘要转换为中文展示...")
