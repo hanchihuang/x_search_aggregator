@@ -9,7 +9,6 @@ import mimetypes
 import os
 import re
 import signal
-import shlex
 import smtplib
 import ssl
 import subprocess
@@ -22,15 +21,12 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
 from typing import Dict, List, Tuple
-from urllib import error as urlerror
-from urllib import request as urlrequest
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 TASKS_DB_PATH = BASE_DIR / "output" / ".web_tasks.json"
-INTEGRATIONS_DB_PATH = BASE_DIR / "output" / ".web_integrations.json"
 MAILER_DB_PATH = BASE_DIR / "output" / ".web_mailer.json"
 DEFAULT_STATE = "auth_state_cookie.json"
 DEFAULT_ZHIHU_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
@@ -51,23 +47,6 @@ app = Flask(__name__)
 
 TASKS: Dict[str, Dict] = {}
 TASKS_LOCK = threading.Lock()
-INTEGRATIONS: Dict[str, Dict] = {
-    "bettafish": {
-        "name": "BettaFish",
-        "path": str((BASE_DIR / "integrations" / "BettaFish").resolve()),
-        "python_cmd": "python",
-        "host": "127.0.0.1",
-        "port": 5000,
-        "status": "idle",
-        "message": "",
-        "error": "",
-        "logs": [],
-        "process": None,
-        "pid": None,
-        "updated_at": "",
-    }
-}
-INTEGRATIONS_LOCK = threading.Lock()
 MAILER: Dict[str, object] = {
     "smtp_host": "mail.alumni.sjtu.edu.cn",
     "smtp_port": 465,
@@ -166,231 +145,6 @@ def load_tasks_from_disk() -> None:
                 if not task["error"]:
                     task["error"] = "服务重启前任务仍在运行，当前仅保留历史状态。"
             TASKS[task["id"]] = task
-
-
-def integration_to_disk_record(item: Dict) -> Dict:
-    return {
-        "name": item["name"],
-        "path": item.get("path", ""),
-        "python_cmd": item.get("python_cmd", "python"),
-        "host": item.get("host", "127.0.0.1"),
-        "port": int(item.get("port", 5000) or 5000),
-        "status": item.get("status", "idle"),
-        "message": item.get("message", ""),
-        "error": item.get("error", ""),
-        "logs": trim_logs(list(item.get("logs", []))),
-        "updated_at": item.get("updated_at", ""),
-    }
-
-
-def save_integrations_to_disk() -> None:
-    with INTEGRATIONS_LOCK:
-        payload = {name: integration_to_disk_record(item) for name, item in INTEGRATIONS.items()}
-    INTEGRATIONS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    INTEGRATIONS_DB_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_integrations_from_disk() -> None:
-    if not INTEGRATIONS_DB_PATH.exists():
-        return
-    try:
-        payload = json.loads(INTEGRATIONS_DB_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    with INTEGRATIONS_LOCK:
-        for name, record in payload.items():
-            if name not in INTEGRATIONS:
-                continue
-            INTEGRATIONS[name].update(
-                {
-                    "path": record.get("path", INTEGRATIONS[name]["path"]),
-                    "python_cmd": record.get("python_cmd", INTEGRATIONS[name]["python_cmd"]),
-                    "host": record.get("host", INTEGRATIONS[name]["host"]),
-                    "port": int(record.get("port", INTEGRATIONS[name]["port"]) or INTEGRATIONS[name]["port"]),
-                    "status": record.get("status", "idle"),
-                    "message": record.get("message", ""),
-                    "error": record.get("error", ""),
-                    "logs": trim_logs(list(record.get("logs", []))),
-                    "updated_at": record.get("updated_at", ""),
-                    "process": None,
-                    "pid": None,
-                }
-            )
-            if INTEGRATIONS[name]["status"] in {"running", "starting", "stopping"}:
-                INTEGRATIONS[name]["status"] = "stopped"
-                INTEGRATIONS[name]["message"] = "服务重启后未保留原进程，仅恢复历史配置。"
-
-
-def integration_log(name: str, line: str) -> None:
-    clean = line.rstrip("\n")
-    with INTEGRATIONS_LOCK:
-        item = INTEGRATIONS.get(name)
-        if not item:
-            return
-        item["logs"].append(clean)
-        item["logs"] = trim_logs(item["logs"])
-        item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_integrations_to_disk()
-
-
-def update_integration(name: str, **changes) -> None:
-    with INTEGRATIONS_LOCK:
-        item = INTEGRATIONS.get(name)
-        if not item:
-            return
-        item.update(changes)
-        item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_integrations_to_disk()
-
-
-def integration_url(name: str) -> str:
-    with INTEGRATIONS_LOCK:
-        item = INTEGRATIONS[name]
-        return f"http://{item['host']}:{item['port']}"
-
-
-def is_service_online(url: str) -> bool:
-    try:
-        with urlrequest.urlopen(f"{url}/api/status", timeout=1.2) as resp:
-            return 200 <= resp.status < 500
-    except Exception:
-        try:
-            with urlrequest.urlopen(url, timeout=1.2) as resp:
-                return 200 <= resp.status < 500
-        except Exception:
-            return False
-
-
-def integration_payload(name: str) -> Dict:
-    with INTEGRATIONS_LOCK:
-        item = INTEGRATIONS.get(name)
-        if not item:
-            return {"error": "integration not found"}
-        process = item.get("process")
-        running = bool(process and process.poll() is None)
-        url = f"http://{item['host']}:{item['port']}"
-        online = is_service_online(url)
-        status = item["status"]
-        error_text = item.get("error", "")
-        message_text = item.get("message", "")
-        if online and not running and status in {"idle", "stopped"}:
-            status = "online"
-        if online and not running:
-            status = "online"
-            error_text = ""
-            if not message_text:
-                message_text = "BettaFish 已在线，可直接打开。"
-        if running:
-            status = "running"
-        return {
-            "name": item["name"],
-            "path": item.get("path", ""),
-            "python_cmd": item.get("python_cmd", "python"),
-            "host": item.get("host", "127.0.0.1"),
-            "port": int(item.get("port", 5000) or 5000),
-            "status": status,
-            "message": message_text,
-            "error": error_text,
-            "logs": "\n".join(item.get("logs", [])),
-            "url": url,
-            "online": online,
-            "updated_at": item.get("updated_at", ""),
-            "pid": item.get("pid"),
-        }
-
-
-def _bettafish_log_pump(process: subprocess.Popen, name: str) -> None:
-    assert process.stdout is not None
-    for line in process.stdout:
-        integration_log(name, line)
-    code = process.wait()
-    with INTEGRATIONS_LOCK:
-        item = INTEGRATIONS.get(name)
-        if not item:
-            return
-        item["process"] = None
-        item["pid"] = None
-        if item.get("status") == "stopping":
-            item["status"] = "stopped"
-            item["message"] = "BettaFish 已停止。"
-        elif code == 0:
-            item["status"] = "stopped"
-            item["message"] = "BettaFish 已退出。"
-        else:
-            item["status"] = "error"
-            item["error"] = f"BettaFish 退出码 {code}"
-        item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_integrations_to_disk()
-
-
-def start_bettafish_service() -> Dict:
-    current = integration_payload("bettafish")
-    if current.get("online"):
-        return current
-    with INTEGRATIONS_LOCK:
-        item = INTEGRATIONS["bettafish"]
-        process = item.get("process")
-        if process and process.poll() is None:
-            return integration_payload("bettafish")
-        app_path = Path(item["path"]).expanduser().resolve()
-        python_cmd = item.get("python_cmd", "python")
-        host = item.get("host", "127.0.0.1")
-        port = int(item.get("port", 5000) or 5000)
-    app_file = app_path / "app.py"
-    if not app_file.exists():
-        raise RuntimeError("BettaFish 路径无效，未找到 app.py。")
-
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-    env["HOST"] = host
-    env["PORT"] = str(port)
-    cmd = shlex.split(python_cmd) + ["app.py"]
-    process = subprocess.Popen(
-        cmd,
-        cwd=app_path,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=1,
-        start_new_session=True,
-    )
-    update_integration("bettafish", process=process, pid=process.pid, status="starting", error="", message="BettaFish 启动中...")
-    integration_log("bettafish", f"[SYSTEM] Starting BettaFish with command: {' '.join(cmd)}")
-    thread = threading.Thread(target=_bettafish_log_pump, args=(process, "bettafish"), daemon=True)
-    thread.start()
-    return integration_payload("bettafish")
-
-
-def stop_bettafish_service() -> Dict:
-    should_save = False
-    with INTEGRATIONS_LOCK:
-        item = INTEGRATIONS["bettafish"]
-        process = item.get("process")
-        if not process or process.poll() is not None:
-            item["status"] = "stopped"
-            item["message"] = "BettaFish 未在当前控制台中运行。"
-            item["process"] = None
-            item["pid"] = None
-            item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            should_save = True
-        else:
-            item["status"] = "stopping"
-            pid = process.pid
-            item["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            should_save = True
-    if should_save:
-        save_integrations_to_disk()
-    if not process or process.poll() is not None:
-        return integration_payload("bettafish")
-    integration_log("bettafish", "[SYSTEM] 正在请求停止 BettaFish ...")
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    return integration_payload("bettafish")
 
 
 def mailer_to_disk_record() -> Dict:
@@ -2338,39 +2092,6 @@ def render_page() -> str:
         </section>
 
         <section class="panel">
-          <h2>BettaFish 集成</h2>
-          <p>接入官方 BettaFish 多 Agent 舆情系统。这里负责管理它的本地路径、启动状态和访问入口，不重写它本身的分析逻辑。</p>
-          <label>BettaFish 本地路径
-            <input type="text" id="bettafishPath" placeholder="/path/to/BettaFish" />
-          </label>
-          <label>Python 命令
-            <input type="text" id="bettafishPython" placeholder="python" />
-          </label>
-          <label>Host
-            <input type="text" id="bettafishHost" placeholder="127.0.0.1" />
-          </label>
-          <label>Port
-            <input type="text" id="bettafishPort" placeholder="5000" />
-          </label>
-          <div class="toolbar">
-            <button class="btn ghost" id="saveBettafishBtn" type="button">保存配置</button>
-            <button class="btn" id="startBettafishBtn" type="button">启动 BettaFish</button>
-            <button class="btn stop" id="stopBettafishBtn" type="button">停止 BettaFish</button>
-            <a class="btn alt" id="openBettafishBtn" href="#" target="_blank" rel="noopener">打开 BettaFish</a>
-          </div>
-          <div class="service-box" style="margin-top: 14px;">
-            <div class="task-card-top">
-              <div class="task-card-title">服务状态</div>
-              <div class="badge" id="bettafishBadge">idle</div>
-            </div>
-            <div class="task-card-meta" id="bettafishMeta">尚未配置 BettaFish 路径。</div>
-            <div class="service-facts" id="bettafishFacts"></div>
-            <div id="bettafishMessage"></div>
-            <pre class="service-log" id="bettafishLogs">暂无 BettaFish 日志。</pre>
-          </div>
-        </section>
-
-        <section class="panel">
           <h2>最近生成的结果</h2>
           <div class="run-list" id="recentRuns"></div>
         </section>
@@ -2428,19 +2149,6 @@ def render_page() -> str:
     const taskListEl = document.getElementById("taskList");
     const refreshTasksBtn = document.getElementById("refreshTasksBtn");
     const stopTaskBtn = document.getElementById("stopTaskBtn");
-    const bettafishPathEl = document.getElementById("bettafishPath");
-    const bettafishPythonEl = document.getElementById("bettafishPython");
-    const bettafishHostEl = document.getElementById("bettafishHost");
-    const bettafishPortEl = document.getElementById("bettafishPort");
-    const saveBettafishBtn = document.getElementById("saveBettafishBtn");
-    const startBettafishBtn = document.getElementById("startBettafishBtn");
-    const stopBettafishBtn = document.getElementById("stopBettafishBtn");
-    const openBettafishBtn = document.getElementById("openBettafishBtn");
-    const bettafishBadgeEl = document.getElementById("bettafishBadge");
-    const bettafishMetaEl = document.getElementById("bettafishMeta");
-    const bettafishFactsEl = document.getElementById("bettafishFacts");
-    const bettafishMessageEl = document.getElementById("bettafishMessage");
-    const bettafishLogsEl = document.getElementById("bettafishLogs");
     const smtpHostEl = document.getElementById("smtpHost");
     const smtpPortEl = document.getElementById("smtpPort");
     const smtpSecurityEl = document.getElementById("smtpSecurity");
@@ -2460,7 +2168,6 @@ def render_page() -> str:
 
     let currentTaskId = null;
     let timerId = null;
-    let integrationTimerId = null;
     let recentRuns = [];
 
     function buildFacts(task) {
@@ -2495,42 +2202,6 @@ def render_page() -> str:
         ">": "&gt;",
         '"': "&quot;"
       }[ch]));
-    }
-
-    function renderBettafish(data) {
-      bettafishPathEl.value = data.path || "";
-      bettafishPythonEl.value = data.python_cmd || "python";
-      bettafishHostEl.value = data.host || "127.0.0.1";
-      bettafishPortEl.value = data.port || 5000;
-      bettafishBadgeEl.textContent = data.status || "idle";
-      bettafishMetaEl.textContent = `地址 ${data.url || "-"} · 更新于 ${data.updated_at || "-"}`;
-      openBettafishBtn.href = data.url || "#";
-      openBettafishBtn.style.pointerEvents = data.url ? "auto" : "none";
-      openBettafishBtn.style.opacity = data.url ? "1" : "0.5";
-      const facts = [
-        `在线检测: ${data.online ? "online" : "offline"}`,
-        `PID: ${data.pid || "-"}`,
-        `Host: ${data.host || "-"}`,
-        `Port: ${data.port || "-"}`,
-      ];
-      bettafishFactsEl.innerHTML = facts.map((fact) => `<span class="service-chip">${escapeHtml(fact)}</span>`).join("");
-      let messageHtml = "";
-      if (data.error) {
-        messageHtml = `<div class="message error">${escapeHtml(data.error)}</div>`;
-      } else if (data.message) {
-        messageHtml = `<div class="message">${escapeHtml(data.message)}</div>`;
-      }
-      bettafishMessageEl.innerHTML = messageHtml;
-      bettafishLogsEl.textContent = data.logs || "暂无 BettaFish 日志。";
-      bettafishLogsEl.scrollTop = bettafishLogsEl.scrollHeight;
-      startBettafishBtn.disabled = ["starting", "running"].includes(data.status);
-      stopBettafishBtn.disabled = !["starting", "running", "online", "stopping"].includes(data.status);
-    }
-
-    async function refreshBettafish() {
-      const res = await fetch("/api/integrations/bettafish");
-      const data = await res.json();
-      renderBettafish(data);
     }
 
     function selectedAttachments() {
@@ -2816,52 +2487,6 @@ def render_page() -> str:
       }
     }
 
-    async function saveBettafishConfig() {
-      const payload = {
-        path: bettafishPathEl.value.trim(),
-        python_cmd: bettafishPythonEl.value.trim(),
-        host: bettafishHostEl.value.trim(),
-        port: bettafishPortEl.value.trim(),
-      };
-      const res = await fetch("/api/integrations/bettafish/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "保存 BettaFish 配置失败");
-      }
-      renderBettafish(data);
-    }
-
-    async function startBettafish() {
-      try {
-        await saveBettafishConfig();
-        const res = await fetch("/api/integrations/bettafish/start", { method: "POST" });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || "启动 BettaFish 失败");
-        }
-        renderBettafish(data);
-      } catch (err) {
-        bettafishMessageEl.innerHTML = `<div class="message error">${escapeHtml(err.message || err)}</div>`;
-      }
-    }
-
-    async function stopBettafish() {
-      try {
-        const res = await fetch("/api/integrations/bettafish/stop", { method: "POST" });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || "停止 BettaFish 失败");
-        }
-        renderBettafish(data);
-      } catch (err) {
-        bettafishMessageEl.innerHTML = `<div class="message error">${escapeHtml(err.message || err)}</div>`;
-      }
-    }
-
     document.querySelectorAll(".js-task-form").forEach((form) => {
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -2879,21 +2504,9 @@ def render_page() -> str:
       }
     });
     sendEmailBtn.addEventListener("click", submitEmailTask);
-    saveBettafishBtn.addEventListener("click", async () => {
-      try {
-        await saveBettafishConfig();
-      } catch (err) {
-        bettafishMessageEl.innerHTML = `<div class="message error">${escapeHtml(err.message || err)}</div>`;
-      }
-    });
-    startBettafishBtn.addEventListener("click", startBettafish);
-    stopBettafishBtn.addEventListener("click", stopBettafish);
-
     refreshRecentRuns();
     refreshTaskList();
     refreshMailerConfig();
-    refreshBettafish();
-    integrationTimerId = setInterval(refreshBettafish, 3000);
     setIdleView();
   </script>
 </body>
@@ -2924,48 +2537,6 @@ def api_mailer_config_save():
         return jsonify(update_mailer(payload))
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
-
-
-@app.get("/api/integrations/bettafish")
-def api_bettafish():
-    return jsonify(integration_payload("bettafish"))
-
-
-@app.post("/api/integrations/bettafish/config")
-def api_bettafish_config():
-    payload = request.get_json(silent=True) or {}
-    path = str(payload.get("path", "")).strip()
-    python_cmd = str(payload.get("python_cmd", "python")).strip() or "python"
-    host = str(payload.get("host", "127.0.0.1")).strip() or "127.0.0.1"
-    raw_port = str(payload.get("port", "5000")).strip() or "5000"
-    try:
-        port = int(raw_port)
-    except ValueError:
-        return jsonify({"error": "BettaFish 端口必须是整数。"}), 400
-    update_integration(
-        "bettafish",
-        path=path,
-        python_cmd=python_cmd,
-        host=host,
-        port=port,
-        message="BettaFish 配置已保存。",
-        error="",
-    )
-    return jsonify(integration_payload("bettafish"))
-
-
-@app.post("/api/integrations/bettafish/start")
-def api_bettafish_start():
-    try:
-        return jsonify(start_bettafish_service())
-    except Exception as exc:
-        update_integration("bettafish", status="error", error=str(exc), message="")
-        return jsonify({"error": str(exc)}), 400
-
-
-@app.post("/api/integrations/bettafish/stop")
-def api_bettafish_stop():
-    return jsonify(stop_bettafish_service())
 
 
 @app.get("/api/tasks")
@@ -3228,7 +2799,6 @@ def serve_file(relpath: str):
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(exist_ok=True)
     load_tasks_from_disk()
-    load_integrations_from_disk()
     load_mailer_from_disk()
     host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
     port = int(os.environ.get("PORT", "8080").strip() or "8080")

@@ -216,6 +216,10 @@ The local console in `web_app.py` is the main product surface.
 - run Folo timeline fetches from the same dashboard
 - run Zhihu user activity exports from the same dashboard
 
+Removed integrations:
+
+- BettaFish-related integration panels and APIs have been removed so the console only exposes the built-in workflows in this repo.
+
 ## Ranking page extras
 
 The generated `usefulness_ranking.html` is no longer just a sorted list.
