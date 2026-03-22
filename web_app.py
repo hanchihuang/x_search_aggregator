@@ -83,7 +83,7 @@ MAILER_LOCK = threading.Lock()
 
 def sanitize_task_params(task_type: str, params: Dict) -> Dict:
     payload = dict(params or {})
-    if task_type in {"zhihu_question", "zhihu_search", "xiaohongshu_user", "xiaohongshu_search", "folo"} and payload.get("cookie"):
+    if task_type in {"zhihu_question", "zhihu_search", "zhihu_user", "xiaohongshu_user", "xiaohongshu_search", "folo"} and payload.get("cookie"):
         payload["cookie"] = "[hidden]"
     if task_type == "x_zhihu_search" and payload.get("zhihu_cookie"):
         payload["zhihu_cookie"] = "[hidden]"
@@ -501,6 +501,7 @@ def parse_recipients(raw_text: str) -> List[str]:
 
 
 def run_report_files(run_dir: Path) -> List[Dict]:
+    run_dir = run_dir.resolve()
     files = [
         ("价值排序页", run_dir / "usefulness_ranking.html"),
         ("深度文章页", run_dir / "article.html"),
@@ -519,11 +520,16 @@ def run_report_files(run_dir: Path) -> List[Dict]:
         ("摘要 Markdown", run_dir / "summary.md"),
         ("详细报告", run_dir / "detailed_report.html"),
         ("详细报告 Markdown", run_dir / "detailed_report.md"),
+        ("知乎用户资料", run_dir / "profile.json"),
+        ("知乎动态链接", run_dir / "activity_links.json"),
+        ("知乎动态全文", run_dir / "full_contents.json"),
+        ("知乎动态 CSV", run_dir / "activities.csv"),
     ]
     items: List[Dict] = []
+    seen_paths = set()
     for label, path in files:
         if path.exists():
-            rel = path.relative_to(BASE_DIR).as_posix()
+            rel = path.resolve().relative_to(BASE_DIR).as_posix()
             items.append(
                 {
                     "label": label,
@@ -533,6 +539,7 @@ def run_report_files(run_dir: Path) -> List[Dict]:
                     "url": f"/files/{rel}",
                 }
             )
+            seen_paths.add(path.resolve())
     manifest_path = run_dir / "combined_manifest.json"
     if manifest_path.exists():
         try:
@@ -548,7 +555,7 @@ def run_report_files(run_dir: Path) -> List[Dict]:
                 path = BASE_DIR / rel_path
                 if not path.exists():
                     continue
-                rel = path.relative_to(BASE_DIR).as_posix()
+                rel = path.resolve().relative_to(BASE_DIR).as_posix()
                 items.append(
                     {
                         "label": label,
@@ -557,6 +564,27 @@ def run_report_files(run_dir: Path) -> List[Dict]:
                         "url": f"/files/{rel}",
                     }
                 )
+                seen_paths.add(path.resolve())
+    # Fallback for new task types that emit useful files but are not yet in the
+    # explicit label list above.
+    for path in sorted(run_dir.iterdir()):
+        if not path.is_file():
+            continue
+        if path.resolve() in seen_paths:
+            continue
+        if path.suffix.lower() not in {".html", ".md", ".json", ".csv", ".txt"}:
+            continue
+        rel = path.resolve().relative_to(BASE_DIR).as_posix()
+        items.append(
+            {
+                "label": path.name,
+                "name": path.name,
+                "path": str(path),
+                "relpath": rel,
+                "url": f"/files/{rel}",
+            }
+        )
+        seen_paths.add(path.resolve())
     return items
 
 
@@ -1486,6 +1514,30 @@ def run_xiaohongshu_search_job(task_id: str, keyword: str, cookie: str, user_age
     )
 
 
+def run_zhihu_user_job(task_id: str, user_url: str, cookie: str, user_agent: str, headless: bool) -> None:
+    before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
+    cmd = [sys.executable, "zhihu_user_activities.py", "--user-url", user_url, "--cookie", cookie]
+    if user_agent:
+        cmd.extend(["--user-agent", user_agent])
+    if headless:
+        cmd.append("--headless")
+    code = run_command_stream(task_id, cmd, "正在抓取知乎用户动态", 5)
+    if code != 0:
+        raise RuntimeError("知乎用户动态抓取失败，请检查日志。")
+
+    run_dir = detect_newest_dir(before)
+    if run_dir is None:
+        raise RuntimeError("知乎用户动态抓取完成，但未找到输出目录。")
+
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"知乎用户动态抓取完成：{user_url}",
+        stage="已完成",
+        progress=100,
+    )
+
+
 def run_folo_job(task_id: str, cookie: str, view: int, limit: int) -> None:
     before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
     cmd = [
@@ -1572,6 +1624,14 @@ def worker(task_id: str) -> None:
             run_xiaohongshu_search_job(
                 task_id,
                 params["keyword"],
+                params["cookie"],
+                params.get("user_agent", ""),
+                params["headless"],
+            )
+        elif task["type"] == "zhihu_user":
+            run_zhihu_user_job(
+                task_id,
+                params["user_url"],
                 params["cookie"],
                 params.get("user_agent", ""),
                 params["headless"],
@@ -2064,10 +2124,10 @@ def render_page() -> str:
           </label>
           <label>时间线视图
             <select name="view">
-              <option value="0">Articles</option>
-              <option value="1">Social</option>
-              <option value="2">Pictures</option>
-              <option value="3">Videos</option>
+              <option value="0">文章</option>
+              <option value="1">社交</option>
+              <option value="2">图片</option>
+              <option value="3">视频</option>
             </select>
           </label>
           <label>展示条数
@@ -2075,6 +2135,26 @@ def render_page() -> str:
           </label>
           <div class="mini-note">输出目录会包含 `results.json`、`summary.json`、`summary.html` 和 `article.html`。</div>
           <button class="btn alt" type="submit">开始抓取 Folo</button>
+        </form>
+
+        <form class="panel js-task-form" data-kind="zhihu_user">
+          <h2>抓取知乎用户全部动态</h2>
+          <p>输入知乎用户主页链接，抓取该用户的回答、文章、想法、视频，以及点赞、喜欢、收藏的内容，并获取每条的完整正文。</p>
+          <label>用户主页
+            <input type="text" name="user_url" placeholder="https://www.zhihu.com/people/youkaichao" required />
+          </label>
+          <label>Cookie 字符串
+            <textarea name="cookie" placeholder="粘贴知乎 Cookie（建议使用你自己的账号 Cookie）" required>__DEFAULT_ZHIHU_COOKIE__</textarea>
+          </label>
+          <label>User-Agent
+            <input type="text" name="user_agent" value="__DEFAULT_ZHIHU_USER_AGENT__" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="headless" value="1" checked />
+            <span>无头模式运行</span>
+          </label>
+          <div class="mini-note">输出目录会包含用户资料、动态链接汇总 JSON、完整内容 JSON 和 CSV 表格。</div>
+          <button class="btn" type="submit">开始抓取知乎用户动态</button>
         </form>
 
         <form class="panel js-task-form" data-kind="user_timeline">
@@ -2638,6 +2718,7 @@ def render_page() -> str:
         zhihu_search: "/api/tasks/zhihu-search",
         xiaohongshu_user: "/api/tasks/xiaohongshu-user",
         xiaohongshu_search: "/api/tasks/xiaohongshu-search",
+        zhihu_user: "/api/tasks/zhihu-user",
         folo: "/api/tasks/folo"
       };
       const endpoint = endpointMap[kind];
@@ -3049,6 +3130,26 @@ def api_task_xiaohongshu_search():
         "xiaohongshu_search",
         {
             "keyword": keyword,
+            "cookie": cookie,
+            "user_agent": (request.form.get("user_agent") or "").strip(),
+            "headless": request.form.get("headless") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/zhihu-user")
+def api_task_zhihu_user():
+    user_url = (request.form.get("user_url") or "").strip()
+    cookie = (request.form.get("cookie") or "").strip()
+    if not user_url:
+        return jsonify({"error": "知乎用户主页不能为空。"}), 400
+    if not cookie:
+        return jsonify({"error": "Cookie 不能为空。"}), 400
+    task_id = start_task(
+        "zhihu_user",
+        {
+            "user_url": user_url,
             "cookie": cookie,
             "user_agent": (request.form.get("user_agent") or "").strip(),
             "headless": request.form.get("headless") == "1",

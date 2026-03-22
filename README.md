@@ -24,6 +24,7 @@ Social Radar turns noisy public content into something you can actually read and
 - Search X by keyword and export a clean HTML report
 - Crawl your following timeline and rank posts by usefulness
 - Pull full answers from Zhihu questions or keyword results
+- Pull all activities from a Zhihu user profile, including answer/article/pin/video links and full text exports
 - Pull Xiaohongshu note lists, full text, images, and comments
 - Pull Folo timeline data with your own cookie inside the same web console
 - Track progress in a local web console instead of staring at terminal logs
@@ -151,7 +152,26 @@ python zhihu_search_keyword_500.py \
   --cookie "<your cookie>"
 ```
 
-### 5. Xiaohongshu keyword top 500
+### 5. Zhihu user full activity export
+
+```bash
+python zhihu_user_activities.py \
+  --user-url "https://www.zhihu.com/people/youkaichao" \
+  --cookie "<your cookie>"
+```
+
+Output:
+
+- `profile.json`
+- `activity_links.json`
+- `full_contents.json`
+- `activities.csv`
+- `summary.md`
+- `article.html`
+
+Answer extraction now retries transient browser failures such as `ERR_NETWORK_CHANGED`, then falls back to the Zhihu answer detail API so CSV exports keep full answer text instead of leaving blanks.
+
+### 6. Xiaohongshu keyword top 500
 
 ```bash
 python xiaohongshu_search_keyword_500.py \
@@ -159,19 +179,20 @@ python xiaohongshu_search_keyword_500.py \
   --cookie "<your cookie>"
 ```
 
-### 6. Folo timeline summary
+### 7. Folo timeline summary
 
 You can run this from the same `http://127.0.0.1:8080` web console.
 
 The new Folo panel supports:
 
 - paste your own Folo cookie
-- choose `Articles / Social / Pictures / Videos`
+- choose `文章 / 社交 / 图片 / 视频`
 - generate `summary.html` and `article.html`
 - auto-curate:
   - `超级提高效率最优帮助`
   - `对 AI 研究最有启发`
 - attach Chinese recommendation reasons to every highlighted item
+- translate feed titles, summaries, and common keywords into Chinese for easier review
 
 CLI entry is also available:
 
@@ -190,6 +211,7 @@ The local console in `web_app.py` is the main product surface.
 - stop running tasks
 - persist task metadata to disk
 - run Folo timeline fetches from the same dashboard
+- run Zhihu user activity exports from the same dashboard
 
 ## Ranking page extras
 
@@ -218,6 +240,7 @@ For a repo like this, the console matters more than the crawler scripts. People 
 ├── crawl_user_following.py
 ├── zhihu_question_answers.py
 ├── zhihu_search_keyword_500.py
+├── zhihu_user_activities.py
 ├── xiaohongshu_search_keyword_500.py
 ├── xiaohongshu_user_notes.py
 ├── folo_fetch.py

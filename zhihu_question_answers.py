@@ -8,6 +8,7 @@ import csv
 import html
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -151,6 +152,21 @@ def fetch_answer_urls_via_api(question_id: str, cookie_header: str, user_agent: 
     return found
 
 
+def fetch_json(url: str, cookie_header: str, user_agent: str, referer: str = "https://www.zhihu.com/") -> Dict:
+    req = urlrequest.Request(
+        url,
+        headers={
+            "Cookie": cookie_header,
+            "User-Agent": user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Referer": referer,
+            "X-Requested-With": "fetch",
+        },
+    )
+    with urlrequest.urlopen(req, timeout=45) as resp:
+        return json.loads(resp.read().decode("utf-8", "ignore"))
+
+
 def scroll_question_page(page, question_id: str, max_scrolls: int, no_new_stop: int, page_delay_ms: int) -> List[str]:
     found: set[str] = set()
     no_new_rounds = 0
@@ -225,6 +241,20 @@ def detect_risk_or_login(page) -> None:
         raise RuntimeError("知乎返回了风控或登录校验页面。请更新 Cookie 后重试。")
 
 
+def html_to_text(fragment: str) -> str:
+    text = str(fragment or "")
+    if not text:
+        return ""
+    text = re.sub(r"(?i)<br\\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\\s*>", "\n\n", text)
+    text = re.sub(r"(?i)</div\\s*>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def first_text(page, selectors: Iterable[str]) -> str:
     for selector in selectors:
         locator = page.locator(selector)
@@ -273,13 +303,69 @@ def extract_vote_count(page) -> str:
     return ""
 
 
-def extract_answer(page, answer_url: str, question_title_hint: str, page_delay_ms: int) -> Dict:
-    page.goto(answer_url, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_timeout(page_delay_ms)
-    detect_risk_or_login(page)
-    click_expand_buttons(page)
-    page.wait_for_timeout(500)
+def fetch_answer_detail_via_api(
+    answer_url: str,
+    cookie_header: str,
+    user_agent: str,
+    question_title_hint: str,
+) -> Dict:
+    parsed = ANSWER_URL_RE.match(answer_url)
+    if not parsed:
+        raise ValueError(f"不是有效的知乎回答链接: {answer_url}")
+    question_id, answer_id = parsed.group(1), parsed.group(2)
+    api_url = (
+        f"https://www.zhihu.com/api/v4/answers/{answer_id}"
+        "?include=content,created_time,updated_time,voteup_count,author.name,question.title"
+    )
+    payload = fetch_json(
+        api_url,
+        cookie_header=cookie_header,
+        user_agent=user_agent,
+        referer=answer_url,
+    )
+    content = html_to_text(payload.get("content", ""))
+    if not content:
+        raise RuntimeError(f"回答 API 未返回正文：{answer_url}")
+    author = str((payload.get("author") or {}).get("name") or "").strip()
+    question_title = str((payload.get("question") or {}).get("title") or "").strip() or question_title_hint
+    times = []
+    created_time = payload.get("created_time")
+    updated_time = payload.get("updated_time")
+    if created_time:
+        times.append(datetime.fromtimestamp(int(created_time)).isoformat(timespec="seconds"))
+    if updated_time and updated_time != created_time:
+        times.append(datetime.fromtimestamp(int(updated_time)).isoformat(timespec="seconds"))
+    vote_count = payload.get("voteup_count")
+    vote_text = f"{vote_count} 赞同" if vote_count not in (None, "") else ""
+    return {
+        "question_title": question_title,
+        "question_url": f"https://www.zhihu.com/question/{question_id}",
+        "answer_id": answer_id,
+        "answer_url": answer_url,
+        "author": author,
+        "vote_text": vote_text,
+        "times": times,
+        "content": content,
+        "content_length": len(content),
+        "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        "fetch_source": "api",
+    }
 
+
+def is_retryable_navigation_error(exc: Exception) -> bool:
+    message = str(exc or "")
+    retry_markers = [
+        "ERR_NETWORK_CHANGED",
+        "ERR_NETWORK_IO_SUSPENDED",
+        "ERR_INTERNET_DISCONNECTED",
+        "ERR_CONNECTION_RESET",
+        "ERR_CONNECTION_ABORTED",
+        "ERR_TIMED_OUT",
+    ]
+    return any(marker in message for marker in retry_markers)
+
+
+def extract_answer_from_page(page, answer_url: str, question_title_hint: str, page_delay_ms: int) -> Dict:
     title = first_text(page, ["h1.QuestionHeader-title", "h1"]) or question_title_hint
     author = first_text(
         page,
@@ -325,7 +411,43 @@ def extract_answer(page, answer_url: str, question_title_hint: str, page_delay_m
         "content": content,
         "content_length": len(content),
         "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        "fetch_source": "page",
     }
+
+
+def extract_answer(
+    page,
+    answer_url: str,
+    question_title_hint: str,
+    page_delay_ms: int,
+    cookie_header: str = "",
+    user_agent: str = DEFAULT_USER_AGENT,
+    max_retries: int = 3,
+) -> Dict:
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            page.goto(answer_url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(page_delay_ms)
+            detect_risk_or_login(page)
+            click_expand_buttons(page)
+            page.wait_for_timeout(500)
+            return extract_answer_from_page(page, answer_url, question_title_hint, page_delay_ms)
+        except Exception as exc:
+            last_error = exc
+            if not is_retryable_navigation_error(exc) or attempt >= max_retries:
+                break
+            time.sleep(min(attempt, 3))
+    if cookie_header:
+        try:
+            return fetch_answer_detail_via_api(answer_url, cookie_header, user_agent, question_title_hint)
+        except Exception as api_exc:
+            if last_error:
+                raise RuntimeError(f"{last_error}; API 回退失败: {api_exc}") from api_exc
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"回答抓取失败：{answer_url}")
 
 
 def write_json(path: Path, payload) -> None:
@@ -559,7 +681,14 @@ def main() -> int:
         for index, answer_url in enumerate(answer_urls, start=1):
             print(f"[ANSWER] {index}/{len(answer_urls)} {answer_url}")
             try:
-                answer = extract_answer(detail_page, answer_url, question_title, args.page_delay_ms)
+                answer = extract_answer(
+                    detail_page,
+                    answer_url,
+                    question_title,
+                    args.page_delay_ms,
+                    cookie_header=cookie_header,
+                    user_agent=args.user_agent,
+                )
             except TimeoutError as exc:
                 raise RuntimeError(f"回答页打开超时：{answer_url}") from exc
             answers.append(answer)

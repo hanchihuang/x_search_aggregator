@@ -14,6 +14,16 @@ from playwright.sync_api import BrowserContext, Page
 from search_x import TEXT_SELECTORS, TWEET_SELECTORS
 
 STATUS_ID_RE = re.compile(r"/status/(\d+)")
+NOISE_EXACT_TEXTS = {
+    "查看新帖子",
+    "Show new posts",
+    "重试",
+    "Retry",
+}
+NOISE_SUBSTRINGS = (
+    "出错了。请尝试重新加载。",
+    "Something went wrong. Try reloading.",
+)
 
 
 def _normalize_lines(lines: List[str]) -> str:
@@ -49,6 +59,24 @@ def _extract_text_from_article(article) -> str:
     return _normalize_lines(lines)
 
 
+def _is_noise_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    if not normalized:
+        return True
+    if normalized in NOISE_EXACT_TEXTS:
+        return True
+    return any(marker in normalized for marker in NOISE_SUBSTRINGS)
+
+
+def _looks_like_valid_full_text(text: str, fallback_text: str = "") -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    if _is_noise_text(normalized):
+        return False
+    if len(normalized) < 8 and normalized != re.sub(r"\s+", " ", str(fallback_text or "").strip()):
+        return False
+    return True
+
+
 def _find_matching_article(page: Page, tweet_id: str):
     for selector in TWEET_SELECTORS:
         for article in page.query_selector_all(selector):
@@ -61,31 +89,26 @@ def _find_matching_article(page: Page, tweet_id: str):
                 href = ""
             if f"/status/{tweet_id}" in href:
                 return article
-        first = page.query_selector(selector)
-        if first:
-            return first
     return None
 
 
-def extract_full_text_from_page(page: Page, tweet_id: str) -> str:
+def extract_full_text_from_page(page: Page, tweet_id: str, fallback_text: str = "") -> str:
     article = _find_matching_article(page, tweet_id)
     if article:
         text = _extract_text_from_article(article)
-        if text:
+        if _looks_like_valid_full_text(text, fallback_text):
             return text
 
     fallback_selectors = [
         'div[data-testid="tweetText"]',
-        'main',
         'article[data-testid="tweet"]',
     ]
     for selector in fallback_selectors:
-        el = page.query_selector(selector)
-        if not el:
-            continue
-        text = (el.inner_text() or "").strip()
-        if text:
-            return _normalize_lines([line for line in text.splitlines() if line.strip()])
+        for el in page.query_selector_all(selector):
+            text = (el.inner_text() or "").strip()
+            normalized = _normalize_lines([line for line in text.splitlines() if line.strip()])
+            if _looks_like_valid_full_text(normalized, fallback_text):
+                return normalized
     return ""
 
 
@@ -138,7 +161,9 @@ def hydrate_items_with_fulltext(
             progress["processed"] += 1
             progress["failed"] += 1
             continue
-        if resume and str(item.get("full_text_status") or "").strip() == "ok":
+        existing_status = str(item.get("full_text_status") or "").strip()
+        existing_full_text = str(item.get("full_text") or item.get("text") or "").strip()
+        if resume and existing_status == "ok" and _looks_like_valid_full_text(existing_full_text, str(item.get("card_text") or "")):
             progress["processed"] += 1
             progress["hydrated"] += 1
             continue
@@ -157,7 +182,7 @@ def hydrate_items_with_fulltext(
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=90000)
                 page.wait_for_timeout(delay_ms)
-                full_text = extract_full_text_from_page(page, tweet_id)
+                full_text = extract_full_text_from_page(page, tweet_id, previous_text)
                 if full_text:
                     break
                 last_error = "empty"

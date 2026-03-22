@@ -6,23 +6,31 @@ from __future__ import annotations
 import argparse
 import html
 import json
-import os
 import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 API_BASE = "https://api.folo.is"
+TRANSLATE_API_BASE = "https://translate.googleapis.com/translate_a/single"
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 
 VIEW_OPTIONS = {
-    0: "Articles",
-    1: "Social",
-    2: "Pictures",
-    3: "Videos",
+    0: "文章",
+    1: "社交",
+    2: "图片",
+    3: "视频",
+}
+
+VIEW_SLUGS = {
+    0: "articles",
+    1: "social",
+    2: "pictures",
+    3: "videos",
 }
 
 STOPWORDS = {
@@ -50,6 +58,84 @@ AI_RESEARCH_TERMS = {
     "rl", "rlhf", "policy", "policies", "research", "paper", "papers",
     "openai", "anthropic", "deepmind", "architecture", "token", "tokens",
     "memory", "planning", "generalization", "causal",
+}
+
+TERM_TRANSLATIONS = {
+    "agent": "智能体",
+    "agents": "智能体",
+    "workflow": "工作流",
+    "automation": "自动化",
+    "automate": "自动化",
+    "productivity": "生产力",
+    "tool": "工具",
+    "tools": "工具",
+    "plugin": "插件",
+    "plugins": "插件",
+    "github": "GitHub",
+    "actions": "Actions",
+    "cli": "命令行",
+    "code": "代码",
+    "coding": "编程",
+    "developer": "开发者",
+    "developers": "开发者",
+    "deploy": "部署",
+    "deployment": "部署",
+    "integration": "集成",
+    "integrations": "集成",
+    "dashboard": "仪表盘",
+    "platform": "平台",
+    "prompt": "提示词",
+    "prompts": "提示词",
+    "orchestration": "编排",
+    "testing": "测试",
+    "review": "审查",
+    "infra": "基础设施",
+    "sdk": "SDK",
+    "api": "API",
+    "mcp": "MCP",
+    "copilot": "Copilot",
+    "claude": "Claude",
+    "codex": "Codex",
+    "llm": "大语言模型",
+    "llms": "大语言模型",
+    "agi": "通用人工智能",
+    "transformer": "Transformer",
+    "transformers": "Transformer",
+    "model": "模型",
+    "models": "模型",
+    "training": "训练",
+    "inference": "推理",
+    "reasoning": "推理",
+    "alignment": "对齐",
+    "eval": "评测",
+    "evaluation": "评测",
+    "benchmark": "基准测试",
+    "benchmarks": "基准测试",
+    "agentic": "智能体化",
+    "retrieval": "检索",
+    "embedding": "嵌入",
+    "finetuning": "微调",
+    "fine-tuning": "微调",
+    "distillation": "蒸馏",
+    "multimodal": "多模态",
+    "diffusion": "扩散模型",
+    "rl": "强化学习",
+    "rlhf": "基于人类反馈的强化学习",
+    "policy": "策略",
+    "policies": "策略",
+    "research": "研究",
+    "paper": "论文",
+    "papers": "论文",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "deepmind": "DeepMind",
+    "architecture": "架构",
+    "token": "Token",
+    "tokens": "Token",
+    "memory": "记忆",
+    "planning": "规划",
+    "generalization": "泛化",
+    "causal": "因果",
 }
 
 
@@ -91,25 +177,103 @@ def compact_entry(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": entry.get("id"),
         "title": entry.get("title"),
+        "titleOriginal": entry.get("title"),
         "url": entry.get("url"),
         "description": entry.get("description"),
+        "descriptionOriginal": entry.get("description"),
         "summary": entry.get("summary"),
+        "summaryOriginal": entry.get("summary"),
         "publishedAt": entry.get("publishedAt"),
         "insertedAt": entry.get("insertedAt"),
         "feedTitle": feed.get("title"),
+        "feedTitleOriginal": feed.get("title"),
         "feedSiteUrl": feed.get("siteUrl"),
         "feedImage": feed.get("image"),
         "category": subscription.get("category"),
+        "categoryOriginal": subscription.get("category"),
         "read": item.get("read"),
         "mediaCount": len(media),
     }
+
+
+def looks_chinese(text: str) -> bool:
+    if not text:
+        return False
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+    latin_count = len(re.findall(r"[A-Za-z]", text))
+    return cjk_count > 0 and cjk_count >= latin_count
+
+
+class ZhTranslator:
+    def __init__(self) -> None:
+        self.cache: dict[str, str] = {}
+
+    def translate(self, text: str | None) -> str | None:
+        if not text:
+            return text
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized or looks_chinese(normalized):
+            return text
+        cached = self.cache.get(normalized)
+        if cached is not None:
+            return cached
+
+        query = quote(normalized, safe="")
+        url = f"{TRANSLATE_API_BASE}?client=gtx&sl=auto&tl=zh-CN&dt=t&q={query}"
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        try:
+            with urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            translated = "".join(part[0] for part in payload[0] if part and part[0]).strip()
+            if translated:
+                self.cache[normalized] = translated
+                return translated
+        except Exception:
+            pass
+
+        self.cache[normalized] = text
+        return text
+
+
+def localize_entries(entries: list[dict[str, Any]], translator: ZhTranslator) -> None:
+    for entry in entries:
+        title = translator.translate(entry.get("titleOriginal"))
+        summary = translator.translate(entry.get("summaryOriginal"))
+        description = translator.translate(entry.get("descriptionOriginal"))
+        feed_title = translator.translate(entry.get("feedTitleOriginal"))
+        category = translator.translate(entry.get("categoryOriginal"))
+        entry["titleZh"] = title
+        entry["summaryZh"] = summary
+        entry["descriptionZh"] = description
+        entry["feedTitleZh"] = feed_title
+        entry["categoryZh"] = category
+        entry["title"] = title or entry.get("titleOriginal")
+        entry["summary"] = summary or entry.get("summaryOriginal")
+        entry["description"] = description or entry.get("descriptionOriginal")
+        entry["feedTitle"] = feed_title or entry.get("feedTitleOriginal")
+        entry["category"] = category or entry.get("categoryOriginal")
+
+
+def localize_subscriptions(subscriptions: list[dict[str, Any]], translator: ZhTranslator) -> None:
+    for subscription in subscriptions:
+        category = subscription.get("category")
+        translated = translator.translate(category)
+        if translated:
+            subscription["category"] = translated
+
+
+def localize_keywords(keywords: list[str], translator: ZhTranslator) -> list[str]:
+    localized = []
+    for keyword in keywords:
+        localized.append(TERM_TRANSLATIONS.get(keyword, translator.translate(keyword) or keyword))
+    return localized
 
 
 def top_keywords(entries: list[dict[str, Any]], limit: int = 10) -> list[str]:
     bag: Counter[str] = Counter()
     for entry in entries:
         text = " ".join(
-            part for part in [entry.get("title"), entry.get("summary"), entry.get("description")] if part
+            part for part in [entry.get("titleOriginal"), entry.get("summaryOriginal"), entry.get("descriptionOriginal")] if part
         ).lower()
         words = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{3,}", text)
         for word in words:
@@ -120,7 +284,7 @@ def top_keywords(entries: list[dict[str, Any]], limit: int = 10) -> list[str]:
 
 def score_entry(entry: dict[str, Any], terms: set[str]) -> tuple[int, list[str]]:
     text = " ".join(
-        part for part in [entry.get("title"), entry.get("summary"), entry.get("description")] if part
+        part for part in [entry.get("titleOriginal"), entry.get("summaryOriginal"), entry.get("descriptionOriginal")] if part
     ).lower()
     matched = sorted({term for term in terms if term in text})
     score = len(matched) * 3
@@ -135,8 +299,8 @@ def score_entry(entry: dict[str, Any], terms: set[str]) -> tuple[int, list[str]]
 
 def build_efficiency_reason(entry: dict[str, Any], matched_terms: list[str]) -> str:
     parts = []
-    title = (entry.get("title") or "").lower()
-    summary = (entry.get("summary") or entry.get("description") or "").lower()
+    title = (entry.get("titleOriginal") or "").lower()
+    summary = (entry.get("summaryOriginal") or entry.get("descriptionOriginal") or "").lower()
     if any(term in matched_terms for term in ["agent", "agents", "automation", "workflow", "orchestration"]):
         parts.append("这条内容直接涉及 agent、自动化或工作流设计，适合用来改进日常开发流程。")
     if any(term in matched_terms for term in ["plugin", "plugins", "mcp", "cli", "sdk", "api"]):
@@ -152,7 +316,7 @@ def build_efficiency_reason(entry: dict[str, Any], matched_terms: list[str]) -> 
 
 def build_research_reason(entry: dict[str, Any], matched_terms: list[str]) -> str:
     parts = []
-    summary = (entry.get("summary") or entry.get("description") or "").lower()
+    summary = (entry.get("summaryOriginal") or entry.get("descriptionOriginal") or "").lower()
     if any(term in matched_terms for term in ["llm", "llms", "transformer", "transformers", "model", "models"]):
         parts.append("这条内容更接近模型层讨论，能帮助你理解当前主流方法的能力边界和结构特点。")
     if any(term in matched_terms for term in ["training", "inference", "reasoning", "evaluation", "benchmark", "benchmarks"]):
@@ -180,14 +344,14 @@ def curated_highlights(entries: list[dict[str, Any]]) -> dict[str, list[dict[str
             efficiency.append({
                 "entry": entry,
                 "score": eff_score,
-                "matchedTerms": eff_terms[:8],
+                "matchedTerms": [TERM_TRANSLATIONS.get(term, term) for term in eff_terms[:8]],
                 "reason": build_efficiency_reason(entry, eff_terms[:8]),
             })
         if res_terms:
             research.append({
                 "entry": entry,
                 "score": res_score,
-                "matchedTerms": res_terms[:8],
+                "matchedTerms": [TERM_TRANSLATIONS.get(term, term) for term in res_terms[:8]],
                 "reason": build_research_reason(entry, res_terms[:8]),
             })
     efficiency.sort(key=lambda item: item["score"], reverse=True)
@@ -195,12 +359,19 @@ def curated_highlights(entries: list[dict[str, Any]]) -> dict[str, list[dict[str
     return {"efficiency": efficiency[:6], "research": research[:6]}
 
 
-def generate_summary(session: dict[str, Any], subscriptions: list[dict[str, Any]], entries: list[dict[str, Any]], view: int, total_entries: int) -> dict[str, Any]:
+def generate_summary(
+    session: dict[str, Any],
+    subscriptions: list[dict[str, Any]],
+    entries: list[dict[str, Any]],
+    view: int,
+    total_entries: int,
+    translator: ZhTranslator,
+) -> dict[str, Any]:
     user = session.get("user", {}) if isinstance(session, dict) else {}
     category_counts = Counter((item.get("category") or "未分类") for item in subscriptions)
     source_counts = Counter(entry.get("feedTitle") or "未知来源" for entry in entries)
     unread_count = sum(1 for entry in entries if not entry.get("read"))
-    keywords = top_keywords(entries)
+    keywords = localize_keywords(top_keywords(entries), translator)
     highlights = curated_highlights(entries)
 
     top_sources = [{"name": name, "count": count} for name, count in source_counts.most_common(6)]
@@ -216,7 +387,7 @@ def generate_summary(session: dict[str, Any], subscriptions: list[dict[str, Any]
     if top_categories:
         summary_lines.append("订阅分类主要集中在 " + "、".join(f"{row['name']}（{row['count']}）" for row in top_categories[:4]) + "。")
     if keywords:
-        summary_lines.append("最近内容中的高频英文关键词包括：" + "、".join(keywords[:8]) + "。")
+        summary_lines.append("最近内容中的高频关键词包括：" + "、".join(keywords[:8]) + "。")
     if highlights["efficiency"]:
         summary_lines.append("最值得优先阅读的提效内容偏向 " + "、".join(item["entry"].get("title") or "无标题" for item in highlights["efficiency"][:2]) + "。")
     if highlights["research"]:
@@ -370,7 +541,7 @@ def build_report_html(payload: dict[str, Any]) -> str:
 
 def create_run_dir(view: int) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"folo_{VIEW_OPTIONS.get(view, f'view{view}').lower()}_{ts}"
+    name = f"folo_{VIEW_SLUGS.get(view, f'view{view}')}_{ts}"
     run_dir = OUTPUT_DIR / name
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
@@ -388,8 +559,12 @@ def main() -> None:
     subscriptions = subscriptions_resp.get("data", []) if isinstance(subscriptions_resp, dict) else []
     raw_entries = entries_resp.get("data", []) if isinstance(entries_resp, dict) else []
     entries = [compact_entry(item) for item in raw_entries[:limit]]
+    translator = ZhTranslator()
+    print("正在把标题和摘要转换为中文展示...")
+    localize_subscriptions(subscriptions, translator)
+    localize_entries(entries, translator)
 
-    payload = generate_summary(session, subscriptions, entries, view, len(raw_entries))
+    payload = generate_summary(session, subscriptions, entries, view, len(raw_entries), translator)
     run_dir = create_run_dir(view)
     print(f"运行目录: {run_dir}")
 
