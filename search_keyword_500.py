@@ -36,6 +36,12 @@ from search_x_long_runner import walk_collect
 TRANSLATE_API_BASE = "https://translate.googleapis.com/translate_a/single"
 ZH_RE = re.compile(r"[\u4e00-\u9fff]")
 LATIN_RE = re.compile(r"[A-Za-z]")
+TRANSIENT_NAV_ERRORS = (
+    "ERR_NETWORK_CHANGED",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_NETWORK_IO_SUSPENDED",
+    "ERR_TIMED_OUT",
+)
 
 
 def looks_chinese(text: str) -> bool:
@@ -118,10 +124,11 @@ def best_text(item: dict) -> str:
     return ""
 
 
-def build_selected_items(items: list[dict], start_rank: int, end_rank: int) -> list[dict]:
+def build_selected_items(items: list[dict], start_rank: int, end_rank: int, already_sliced: bool = False) -> list[dict]:
     translator = ZhTranslator()
     selected_items = []
-    for idx, item in enumerate(items[start_rank - 1:end_rank], start=start_rank):
+    source_items = items if already_sliced else items[start_rank - 1:end_rank]
+    for idx, item in enumerate(source_items, start=start_rank):
         original_text = best_text(item)
         selected_items.append(
             {
@@ -242,6 +249,37 @@ def write_selected_outputs(
     (run_dir / "selected_zh.html").write_text(page, encoding="utf-8")
 
 
+def is_transient_navigation_error(exc: Exception) -> bool:
+    message = str(exc or "")
+    return any(token in message for token in TRANSIENT_NAV_ERRORS)
+
+
+def safe_query_selector_exists(page, selector: str) -> bool:
+    try:
+        return bool(page.query_selector(selector))
+    except Exception as exc:
+        message = str(exc or "")
+        if "Execution context was destroyed" in message or "Target page, context or browser has been closed" in message:
+            return False
+        raise
+
+
+def navigate_with_retry(page, url: str, attempts: int = 3, logger=print, timeout: int = 120000, settle_ms: int = 3000) -> bool:
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            page.wait_for_timeout(settle_ms)
+            return True
+        except Exception as exc:
+            last_exc = exc
+            logger(f"警告: 页面加载超时或出错({exc})，尝试继续...")
+            if not is_transient_navigation_error(exc) or attempt >= attempts:
+                break
+            page.wait_for_timeout(1200 * attempt)
+    return False
+
+
 def open_search_with_recovery(page, search_url: str, query_text: str, sort: str, lang: str) -> None:
     network_error_selectors = [
         'span:has-text("似乎你的连接已断开")',
@@ -251,22 +289,14 @@ def open_search_with_recovery(page, search_url: str, query_text: str, sort: str,
     ]
 
     def has_network_interrupted() -> bool:
-        return any(page.query_selector(selector) for selector in network_error_selectors)
+        return any(safe_query_selector_exists(page, selector) for selector in network_error_selectors)
 
-    try:
-        page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
-    except Exception as exc:
-        print(f"警告: 页面加载超时或出错({exc})，尝试继续...")
-    page.wait_for_timeout(3000)
+    navigate_with_retry(page, search_url)
 
     for attempt in range(3):
         if has_network_interrupted():
             print(f"警告: 搜索页显示连接中断，执行第 {attempt + 1} 次重载...")
-            try:
-                page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
-            except Exception as exc:
-                print(f"警告: 重载搜索页时出错({exc})，尝试继续...")
-            page.wait_for_timeout(3500)
+            navigate_with_retry(page, search_url, logger=lambda msg: print(msg.replace("页面加载", "重载搜索页")))
             continue
         break
 
@@ -279,11 +309,7 @@ def open_search_with_recovery(page, search_url: str, query_text: str, sort: str,
         return
 
     print("警告: 当前页回退失败，尝试跳转到 Explore 页重新发起搜索...")
-    try:
-        page.goto("https://x.com/explore", wait_until="domcontentloaded", timeout=120000)
-    except Exception as exc:
-        print(f"警告: Explore 页加载超时或出错({exc})，尝试继续...")
-    page.wait_for_timeout(2500)
+    navigate_with_retry(page, "https://x.com/explore", logger=lambda msg: print(msg.replace("页面加载", "Explore 页加载")), settle_ms=2500)
     fallback_search_via_input(page, query_text, sort, lang)
     wait_for_search_results(page, timeout=20000)
 
@@ -307,6 +333,20 @@ def collect_items_from_search_responses(response_bodies: list[str]) -> list[dict
             seen_ids.add(tid)
             rows.append(item)
     return rows
+
+
+def merge_items_with_network_recovery(dom_items: list[dict], network_items: list[dict]) -> tuple[list[dict], bool]:
+    merged = list(dom_items)
+    seen_ids = {str(item.get("tweet_id") or "").strip() for item in dom_items if str(item.get("tweet_id") or "").strip()}
+    recovered = False
+    for item in network_items:
+        tweet_id = str(item.get("tweet_id") or "").strip()
+        if not tweet_id or tweet_id in seen_ids:
+            continue
+        seen_ids.add(tweet_id)
+        merged.append(item)
+        recovered = True
+    return merged, recovered
 
 
 def parse_args() -> argparse.Namespace:
@@ -342,17 +382,17 @@ def main() -> None:
     args = parse_args()
     query_text, search_url, sort = resolve_search_input(args.keyword, args.search_url, args.lang)
     start_rank, end_rank = clamp_range(args.start_rank, args.end_rank)
-    max_items = max(500, end_rank)
+    max_items = end_rank
     recovered_from_network = False
 
     out_base = Path(args.out_dir).expanduser().resolve()
-    run_dir = out_base / f"{safe_name(query_text)}_500_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = out_base / f"{safe_name(query_text)}_{start_rank}_{end_rank}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"运行目录: {run_dir}")
 
     print(f"搜索关键词: {query_text}")
     print(f"搜索URL: {search_url}")
-    print(f"目标: 收集前{max_items}条最新内容")
+    print(f"目标: 至少收集到第{end_rank}条内容")
     print(f"返回区间: 第{start_rank}到第{end_rank}条中文版内容")
     print("=" * 60)
 
@@ -403,10 +443,20 @@ def main() -> None:
             scroll_pause=args.scroll_pause,
             checkpoint_cb=make_search_checkpoint_callback(run_dir, query_text),
         )
-        if not items and search_response_bodies:
-            print(f"列表页未渲染出卡片，尝试从 {len(search_response_bodies)} 个 SearchTimeline 网络响应中恢复结果...")
-            items = collect_items_from_search_responses(search_response_bodies)
-            recovered_from_network = bool(items)
+        if search_response_bodies:
+            network_items = collect_items_from_search_responses(search_response_bodies)
+            if not items and network_items:
+                print(f"列表页未渲染出卡片，尝试从 {len(search_response_bodies)} 个 SearchTimeline 网络响应中恢复结果...")
+                items = network_items
+                recovered_from_network = True
+            elif items and network_items:
+                merged_items, recovered_more = merge_items_with_network_recovery(items, network_items)
+                if recovered_more:
+                    recovered_count = len(merged_items) - len(items)
+                    print(
+                        f"检测到 DOM 滚动结果可能不完整，已从 {len(search_response_bodies)} 个 SearchTimeline 网络响应补回 {recovered_count} 条结果..."
+                    )
+                    items = merged_items
         context.close()
 
     if not items:
@@ -426,8 +476,17 @@ def main() -> None:
 
     print(f"成功收集 {len(items)} 条推文（目标: {max_items}条）")
 
+    if len(items) < start_rank:
+        print(
+            f"错误: 仅收集到 {len(items)} 条内容，未达到你要求的起始序号第 {start_rank} 条。"
+        )
+        sys.exit(2)
+
+    requested_items = items[start_rank - 1:end_rank]
+    print(f"按请求区间实际返回 {len(requested_items)} 条内容")
+
     stage1_json_path = run_dir / "results_stage1.json"
-    stage1_json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    stage1_json_path.write_text(json.dumps(requested_items, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"阶段1结果已保存: {stage1_json_path}")
 
     if recovered_from_network:
@@ -438,9 +497,9 @@ def main() -> None:
         print("开始第二阶段：逐条补全推文全文...")
         with sync_playwright() as p:
             context = create_context(p, args.state, args.headless)
-            items = hydrate_items_with_fulltext(
+            requested_items = hydrate_items_with_fulltext(
                 context=context,
-                items=items,
+                items=requested_items,
                 run_dir=run_dir,
                 checkpoint_every=args.fulltext_checkpoint_every,
                 delay_ms=args.fulltext_delay_ms,
@@ -449,7 +508,7 @@ def main() -> None:
             context.close()
 
     # 生成摘要
-    summary = summarize(items, query_text)
+    summary = summarize(requested_items, query_text)
 
     # 保存结果
     json_path = run_dir / "results.json"
@@ -458,12 +517,12 @@ def main() -> None:
     summary_md = run_dir / "summary.md"
     article_html = run_dir / "article.html"
 
-    checkpoint_search_outputs(run_dir, items, query_text)
-    selected_items = build_selected_items(items, start_rank, end_rank)
+    checkpoint_search_outputs(run_dir, requested_items, query_text)
+    selected_items = build_selected_items(requested_items, start_rank, end_rank, already_sliced=True)
     write_selected_outputs(run_dir, query_text, search_url, start_rank, end_rank, selected_items)
 
     print("=" * 60)
-    print(f"完成！已收集 {len(items)} 条推文。")
+    print(f"完成！按区间返回 {len(requested_items)} 条推文。")
     print(f"区间中文JSON: {run_dir / 'selected_zh.json'}")
     print(f"区间中文Markdown: {run_dir / 'selected_zh.md'}")
     print(f"区间中文HTML: {run_dir / 'selected_zh.html'}")

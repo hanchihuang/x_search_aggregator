@@ -163,7 +163,9 @@ def hydrate_items_with_fulltext(
             continue
         existing_status = str(item.get("full_text_status") or "").strip()
         existing_full_text = str(item.get("full_text") or item.get("text") or "").strip()
-        if resume and existing_status == "ok" and _looks_like_valid_full_text(existing_full_text, str(item.get("card_text") or "")):
+        if resume and existing_status in {"ok", "retained"} and _looks_like_valid_full_text(
+            existing_full_text, str(item.get("card_text") or "")
+        ):
             progress["processed"] += 1
             progress["hydrated"] += 1
             continue
@@ -204,6 +206,11 @@ def hydrate_items_with_fulltext(
             item["text"] = full_text
             item["full_text_status"] = "ok"
             item["full_text_fetched_at"] = datetime.now(timezone.utc).isoformat()
+            progress["hydrated"] += 1
+        elif _looks_like_valid_full_text(previous_text, str(item.get("card_text") or "")):
+            item["full_text"] = previous_text
+            item["text"] = previous_text
+            item["full_text_status"] = "retained"
             progress["hydrated"] += 1
         else:
             item["full_text"] = previous_text

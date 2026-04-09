@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 from html_report import write_html_article
+from extract_research_mentions import extract_research_mentions, write_outputs as write_research_outputs
 from search_x import (
     HASHTAG_RE,
     MENTION_RE,
@@ -53,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scroll-pause", type=int, default=1500, help="Pause between scrolls in ms")
     p.add_argument("--with-replies", action="store_true", help="Crawl /with_replies timeline")
     p.add_argument("--skip-fulltext", action="store_true", help="Skip stage-2 hydration from tweet detail pages")
+    p.add_argument(
+        "--extract-research-mentions",
+        action="store_true",
+        help="After crawling, extract mentioned papers, models, and tricks from tweet text",
+    )
     p.add_argument("--fulltext-delay-ms", type=int, default=1200, help="Pause after opening each tweet detail page")
     p.add_argument("--fulltext-checkpoint-every", type=int, default=10, help="Write hydration checkpoint every N tweets")
     p.add_argument("--cdp-url", default="", help="Existing Chrome CDP endpoint, e.g. http://127.0.0.1:9222")
@@ -634,6 +640,14 @@ def main() -> None:
     detailed_html = run_dir / "detailed_report.html"
 
     checkpoint_user_timeline_outputs(run_dir, items, handle)
+
+    if args.extract_research_mentions:
+        print("Stage 3: extracting mentioned papers, models, and tricks...")
+        research_result = extract_research_mentions(items)
+        write_research_outputs(research_result, run_dir)
+        print(f"Research mentions JSON: {run_dir / 'research_mentions.json'}")
+        print(f"Research mentions MD:   {run_dir / 'research_mentions.md'}")
+        print(f"Research mentions HTML: {run_dir / 'research_mentions.html'}")
 
     print("=" * 60)
     print(f"Done. Collected {len(items)} tweets from @{handle}.")

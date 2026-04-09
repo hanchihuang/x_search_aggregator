@@ -297,6 +297,9 @@ def run_report_files(run_dir: Path) -> List[Dict]:
         ("区间中文 Markdown", run_dir / "selected_zh.md"),
         ("详细报告", run_dir / "detailed_report.html"),
         ("详细报告 Markdown", run_dir / "detailed_report.md"),
+        ("论文/模型/Tricks 提取 JSON", run_dir / "research_mentions.json"),
+        ("论文/模型/Tricks 提取 Markdown", run_dir / "research_mentions.md"),
+        ("论文/模型/Tricks 提取 HTML", run_dir / "research_mentions.html"),
         ("知乎用户资料", run_dir / "profile.json"),
         ("知乎动态链接", run_dir / "activity_links.json"),
         ("知乎动态全文", run_dir / "full_contents.json"),
@@ -698,6 +701,17 @@ def read_fulltext_progress(run_dir: Path | None) -> Dict[str, int]:
     }
 
 
+def resolve_fulltext_stats(task: Dict, run_dir: Path | None) -> Dict[str, int]:
+    if run_dir and run_dir.exists() and (run_dir / "fulltext_progress.json").exists():
+        return read_fulltext_progress(run_dir)
+    return {
+        "fulltext_total": int(task.get("fulltext_total", 0) or 0),
+        "fulltext_processed": int(task.get("fulltext_processed", 0) or 0),
+        "fulltext_hydrated": int(task.get("fulltext_hydrated", 0) or 0),
+        "fulltext_failed": int(task.get("fulltext_failed", 0) or 0),
+    }
+
+
 def append_log(task_id: str, line: str) -> None:
     clean = line.rstrip("\n")
     with TASKS_LOCK:
@@ -869,7 +883,7 @@ def list_tasks_payload(limit: int = 24) -> List[Dict]:
     payload = []
     for task in tasks[:limit]:
         run_dir = Path(task["result_dir"]) if task.get("result_dir") else None
-        fulltext = read_fulltext_progress(run_dir)
+        fulltext = resolve_fulltext_stats(task, run_dir)
         payload.append(
             {
                 "id": task["id"],
@@ -888,10 +902,10 @@ def list_tasks_payload(limit: int = 24) -> List[Dict]:
                 "current_scroll": task.get("current_scroll", 0),
                 "max_scrolls": task.get("max_scrolls", 0),
                 "last_new_items": task.get("last_new_items", 0),
-                "fulltext_total": fulltext["fulltext_total"] or task.get("fulltext_total", 0),
-                "fulltext_processed": fulltext["fulltext_processed"] or task.get("fulltext_processed", 0),
-                "fulltext_hydrated": fulltext["fulltext_hydrated"] or task.get("fulltext_hydrated", 0),
-                "fulltext_failed": fulltext["fulltext_failed"] or task.get("fulltext_failed", 0),
+                "fulltext_total": fulltext["fulltext_total"],
+                "fulltext_processed": fulltext["fulltext_processed"],
+                "fulltext_hydrated": fulltext["fulltext_hydrated"],
+                "fulltext_failed": fulltext["fulltext_failed"],
             }
         )
     return payload
@@ -1032,7 +1046,7 @@ def task_payload(task_id: str) -> Dict:
                 {"label": label, "url": url}
                 for label, url in resolve_report_links(run_dir)
             ]
-        fulltext = read_fulltext_progress(run_dir)
+        fulltext = resolve_fulltext_stats(task, run_dir)
         return {
             "id": task["id"],
             "type": task["type"],
@@ -1052,10 +1066,10 @@ def task_payload(task_id: str) -> Dict:
             "current_scroll": task.get("current_scroll", 0),
             "max_scrolls": task.get("max_scrolls", 0),
             "last_new_items": task.get("last_new_items", 0),
-            "fulltext_total": fulltext["fulltext_total"] or task.get("fulltext_total", 0),
-            "fulltext_processed": fulltext["fulltext_processed"] or task.get("fulltext_processed", 0),
-            "fulltext_hydrated": fulltext["fulltext_hydrated"] or task.get("fulltext_hydrated", 0),
-            "fulltext_failed": fulltext["fulltext_failed"] or task.get("fulltext_failed", 0),
+            "fulltext_total": fulltext["fulltext_total"],
+            "fulltext_processed": fulltext["fulltext_processed"],
+            "fulltext_hydrated": fulltext["fulltext_hydrated"],
+            "fulltext_failed": fulltext["fulltext_failed"],
         }
 
 
@@ -1143,6 +1157,7 @@ def run_user_timeline_job(
     state: str,
     headless: bool,
     hydrate_fulltext: bool,
+    extract_research_mentions: bool,
     cdp_url: str = "",
     auto_launch: bool = False,
 ) -> None:
@@ -1152,6 +1167,8 @@ def run_user_timeline_job(
         cmd.append("--skip-fulltext")
     if headless:
         cmd.append("--headless")
+    if extract_research_mentions:
+        cmd.append("--extract-research-mentions")
     if cdp_url:
         cmd.extend(["--cdp-url", cdp_url])
     if auto_launch:
@@ -1471,6 +1488,7 @@ def worker(task_id: str) -> None:
                 params["state"],
                 params["headless"],
                 params.get("hydrate_fulltext", True),
+                params.get("extract_research_mentions", False),
                 params.get("cdp_url", ""),
                 params.get("auto_launch", False),
             )
@@ -2104,6 +2122,10 @@ def render_page() -> str:
           <label class="checkbox">
             <input type="checkbox" name="hydrate_fulltext" value="1" checked />
             <span>逐条进入详情页补全文</span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="extract_research_mentions" value="1" />
+            <span>抓完后提取推文里提到的论文、模型和 tricks</span>
           </label>
           <div class="mini-note">运行中会周期性保存部分结果；如果中途点击停止，会尽量立即生成当前已抓取内容的汇总 HTML。</div>
           <button class="btn" type="submit">开始抓取历史推文</button>
@@ -2819,6 +2841,7 @@ def api_task_user_timeline():
             "auto_launch": request.form.get("auto_launch") == "1",
             "headless": request.form.get("headless") == "1",
             "hydrate_fulltext": request.form.get("hydrate_fulltext") == "1",
+            "extract_research_mentions": request.form.get("extract_research_mentions") == "1",
         },
     )
     return jsonify({"task_id": task_id})

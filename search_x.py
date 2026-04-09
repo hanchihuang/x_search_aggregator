@@ -315,22 +315,26 @@ def extract_tweet(article) -> Optional[Dict]:
 
 
 def wait_for_search_results(page: Page, timeout: int = 10000) -> bool:
-    """Wait for search results to load with multiple validation strategies"""
-    try:
-        # Wait for any of the tweet selectors to appear
-        for selector in TWEET_SELECTORS:
-            try:
-                page.wait_for_selector(selector, timeout=timeout//len(TWEET_SELECTORS))
-                return True
-            except TimeoutError:
-                continue
-        
-        # Fallback: wait for general content
-        page.wait_for_selector('main, section, div[role="feed"]', timeout=timeout)
-        return True
-    except TimeoutError:
-        print("Warning: Could not detect search results loading")
-        return False
+    """Wait for actual search results or explicit empty/end states."""
+    retry_selectors = [
+        'button:has-text("重试")',
+        'button:has-text("Retry")',
+        'div[role="button"]:has-text("重试")',
+        'div[role="button"]:has-text("Retry")',
+    ]
+
+    deadline = time.time() + max(timeout, 1) / 1000
+    while time.time() < deadline:
+        if get_cards(page):
+            return True
+        if has_end_marker(page):
+            return True
+        if any(page.query_selector(selector) for selector in retry_selectors):
+            return True
+        page.wait_for_timeout(250)
+
+    print("Warning: Could not detect search results loading")
+    return False
 
 
 def handle_search_error_retry(page: Page, attempts: int = 3) -> bool:
@@ -421,8 +425,9 @@ def collect_tweets(
     anchor_stall_rounds = 0
     last_anchor = ""
     
-    # Initial wait for page to load
-    time.sleep(2)
+    # Initial wait for the first batch to settle before we start scrolling.
+    wait_for_search_results(page, timeout=max(scroll_pause * 3, 8000))
+    page.wait_for_timeout(min(scroll_pause, 2500))
     
     for idx in range(max_scrolls):
         cards = get_cards(page)
