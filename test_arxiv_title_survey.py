@@ -99,7 +99,8 @@ class PartialCorpusTests(unittest.TestCase):
             self.assertIn("- 请求篇数：10", survey)
             self.assertIn("- 实际篇数：1", survey)
             self.assertIn("# 关于“gsm8k”相关 arXiv 论文的中文综述", survey)
-            self.assertIn("## 四、逐篇综述", survey)
+            self.assertIn("## 五、逐篇深入综述", survey)
+            self.assertIn("## 六、横向比较与综合讨论", survey)
 
 
 if __name__ == "__main__":

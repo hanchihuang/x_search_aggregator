@@ -71,6 +71,9 @@ METHOD_HINTS_STRONG = (
 METHOD_HINTS_WEAK = ("method", "design", "develop")
 RESULT_HINTS = ("result", "show", "demonstrate", "achieve", "outperform", "improve", "gain", "performance")
 LIMIT_HINTS = ("limit", "future", "challenge", "however", "remain", "still", "yet")
+DATASET_HINTS = ("dataset", "datasets", "benchmark", "benchmarks", "corpus", "gsm8k", "math", "word problems")
+METRIC_HINTS = ("accuracy", "acc", "f1", "score", "performance", "pass@", "metric", "%")
+BASELINE_HINTS = ("baseline", "baselines", "gpt-4", "claude", "deepseek", "llm", "models")
 
 
 @dataclass
@@ -271,6 +274,13 @@ def split_sentences(text: str) -> list[str]:
     return sentences or [text]
 
 
+def shorten(text: str, limit: int = 220) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
 def pick_sentence(sentences: Iterable[str], hints: tuple[str, ...], fallback: str = "") -> str:
     for sentence in sentences:
         lower = sentence.lower()
@@ -371,6 +381,35 @@ def summarize_paper(paper: Paper) -> dict[str, str]:
     }
 
 
+def load_paper_markdown_summary(md_path: Path) -> dict[str, str]:
+    text = md_path.read_text(encoding="utf-8")
+    abstract = ""
+    full_text = ""
+    if "## Abstract" in text and "## Full Text" in text:
+        abstract = text.split("## Abstract", 1)[1].split("## Full Text", 1)[0].strip()
+        full_text = text.split("## Full Text", 1)[1].strip()
+    sentences = split_sentences(f"{abstract} {full_text}")
+
+    def collect(hints: tuple[str, ...], fallback: str) -> str:
+        matched = []
+        for sentence in sentences:
+            lower = sentence.lower()
+            if any(hint in lower for hint in hints):
+                matched.append(shorten(sentence))
+            if len(matched) >= 2:
+                break
+        if matched:
+            return "；".join(matched)
+        return fallback
+
+    return {
+        "dataset_evidence": collect(DATASET_HINTS, "全文中未稳定抽取到明确数据集描述，需人工复核。"),
+        "metric_evidence": collect(METRIC_HINTS, "全文中未稳定抽取到明确评价指标描述，需人工复核。"),
+        "baseline_evidence": collect(BASELINE_HINTS, "全文中未稳定抽取到明确基线或对比对象描述，需人工复核。"),
+        "method_detail": collect(METHOD_HINTS_STRONG + METHOD_HINTS_WEAK, "全文中未稳定抽取到更具体的方法细节，需人工复核。"),
+    }
+
+
 def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path, requested_limit: int) -> str:
     focus_terms = extract_focus_terms(papers)
     translator = ZhTranslator()
@@ -380,6 +419,8 @@ def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path, req
         year = paper.published[:4] if paper.published else "unknown"
         rows.append(f"| {idx} | {paper.title} | {year} | {paper.arxiv_id} |")
         summary = summarize_paper(paper)
+        md_path = note_dir.parent / "papers_md" / f"{idx:02d}_{safe_name(paper.arxiv_id)}.md"
+        fulltext_summary = load_paper_markdown_summary(md_path)
         translated_notes.append(
             {
                 "title": paper.title,
@@ -387,6 +428,10 @@ def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path, req
                 "method_zh": translator.translate(summary["method"]) or summary["method"],
                 "result_zh": translator.translate(summary["result"]) or summary["result"],
                 "limitation_zh": translator.translate(summary["limitation"]) or summary["limitation"],
+                "dataset_zh": translator.translate(fulltext_summary["dataset_evidence"]) or fulltext_summary["dataset_evidence"],
+                "metric_zh": translator.translate(fulltext_summary["metric_evidence"]) or fulltext_summary["metric_evidence"],
+                "baseline_zh": translator.translate(fulltext_summary["baseline_evidence"]) or fulltext_summary["baseline_evidence"],
+                "method_detail_zh": translator.translate(fulltext_summary["method_detail"]) or fulltext_summary["method_detail"],
             }
         )
 
@@ -397,10 +442,17 @@ def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path, req
         "从现有语料看，这批论文主要聚焦在任务求解能力、推理过程建模、评测基准设计以及小模型性能提升几个方向。"
     )
     synthesis_lines = [
-        f"综合这批论文，可以看到当前研究并不只是在追求更高分数，而是在重新拆解“模型为什么能做对题、又为什么会做错题”这一问题。",
-        "一类工作强调直接提升求解器的题意理解与推理链质量，试图减少语义误解、遗漏步骤和计算错误。",
-        "另一类工作把重点放在评测范式本身，认为只看最终答案不足以区分模型能力，因此需要引入对推理过程、元推理能力或视觉上下文的考察。",
-        "同时，也有工作证明小模型并非天然缺乏数学推理能力，只要数据构造、训练方式和验证机制设计得当，参数规模较小的模型同样可以取得有竞争力的结果。",
+        "从整体上看，这批论文共享一个核心判断：GSM8K 这类数学文本推理任务的难点，不仅在于算对答案，更在于能否持续维持正确的问题理解、步骤展开、验证与纠错能力。",
+        "因此，现有研究逐渐从“单点提升准确率”转向“拆分推理链条中的薄弱环节”，也就是把误差来源细化为语义理解偏差、推理步骤遗漏、验证机制缺失、评测口径过窄等多个层面。",
+        "这种变化意味着综述不应该只比较最终分数，而应该比较每篇论文到底在解决推理流程中的哪一段问题，以及它依赖了什么额外结构、监督或评测设计。",
+        "在这批论文里，既能看到直接改造求解器的工作，也能看到重新设计基准和评价范式的工作，还能看到利用更小模型配合训练和验证机制实现高性价比提升的工作。",
+    ]
+    stratification_lines = [
+        "若按研究问题拆分，这批论文大致可分为四类。",
+        "第一类是“求解质量提升”，目标是让模型更准确地理解题意并生成更稳健的推理链。",
+        "第二类是“错误来源分析”，重点解释模型为什么在数学题上仍然会出现语义误读、计算失误和步骤缺失。",
+        "第三类是“评测范式扩展”，即认为原有 GSM8K 只看答案过于粗糙，因此引入元推理或视觉上下文，重新考查模型能力边界。",
+        "第四类是“轻量化求解”，探索小模型在专门数据与验证框架支持下，是否也能逼近甚至超过更大模型。",
     ]
     per_paper_lines = []
     for idx, note in enumerate(translated_notes, start=1):
@@ -410,25 +462,37 @@ def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path, req
                 "",
                 f"这篇论文主要关注：{note['problem_zh']}",
                 f"其核心做法是：{note['method_zh']}",
+                f"如果结合全文线索来看，方法细节进一步表现为：{note['method_detail_zh']}",
                 f"论文报告的主要发现是：{note['result_zh']}",
+                f"从全文中可直接抓到的实验对象或数据线索包括：{note['dataset_zh']}",
+                f"从全文中可直接抓到的评价指标或结果线索包括：{note['metric_zh']}",
+                f"从全文中可直接抓到的基线或对比对象线索包括：{note['baseline_zh']}",
                 f"从作者摘要中能直接看到的限制或后续空间是：{note['limitation_zh']}",
                 "",
             ]
         )
     compare_lines = [
         "从横向比较看，这批论文至少体现出三条明显路线：",
-        "1. 求解增强路线：通过更强的问题理解、推理拆解或验证机制提高 GSM8K 一类任务上的解题正确率。",
-        "2. 评测增强路线：通过元推理、视觉扩展等方式，让基准不再只考最终答案，而是考查模型的推理质量与泛化边界。",
-        "3. 轻量化路线：探索小模型在专门数据与验证框架支持下能否逼近甚至超过更大模型的表现。",
+        "1. 求解增强路线：通过更强的问题理解、推理拆解或验证机制提高 GSM8K 一类任务上的解题正确率。这一路线更关心“怎么解得更对”。",
+        "2. 评测增强路线：通过元推理、视觉扩展等方式，让基准不再只考最终答案，而是考查模型的推理质量与泛化边界。这一路线更关心“怎么测得更准”。",
+        "3. 轻量化路线：探索小模型在专门数据与验证框架支持下能否逼近甚至超过更大模型的表现。这一路线更关心“能否用更低成本获得足够强的推理表现”。",
         "",
         "这些路线的共同点，是都把“分数”看作结果变量，而把“推理过程”视为真正需要被建模、被监督、被评估的对象。",
+        "更具体地说，求解增强路线主要在模型内部做文章，评测增强路线主要在任务定义和评分方式上做文章，而轻量化路线则在模型规模、训练样本和验证机制之间寻找新的效率平衡。",
+    ]
+    evidence_compare_lines = [
+        "如果从实验设计角度继续对比，还能看到几个值得在综述里单独强调的现象。",
+        "一是多篇论文都把 GSM8K 视为核心验证对象，但它们对“提升来自哪里”的解释并不相同：有的归因于更强的问题理解，有的归因于验证或评分机制，有的归因于任务重构。",
+        "二是部分论文已经不满足于在原始文本题面上竞争，而是主动把任务扩展到视觉情境或元推理场景，这说明单一基准上的高分正在逐渐失去足够的解释力。",
+        "三是小模型路线的意义并不只是节省参数量，而是在提醒研究者：如果训练样本、验证器和解题流程设计得足够有针对性，模型规模并不是唯一决定因素。",
     ]
     gap_lines = [
         "尽管现有论文已经覆盖了求解、评测和模型规模三个层面，但仍存在一些共同缺口。",
-        "第一，很多论文在摘要层面强调结果提升，却没有充分说明方法在不同题型、不同错误类型上的稳定性。",
-        "第二，跨论文之间使用的数据组织、验证策略和错误分类标准并不完全一致，导致横向比较仍然有口径差异。",
-        "第三，部分工作已经开始引入视觉上下文或元推理评测，但这也意味着传统 GSM8K 分数不再足以代表真实的数学推理能力全貌。",
-        "后续如果要写成更完整的中文综述，建议继续回到全文中补充实验设置、数据构造、基线选择和误差分析，再把这些信息并入分章节比较。",
+        "第一，很多论文虽然报告了显著的结果提升，但对“提升是否稳定”说明不足，例如不同题型、不同错误类型、不同 prompt 设置下是否仍然成立。",
+        "第二，跨论文之间使用的数据组织、验证策略和错误分类标准并不完全一致，导致横向比较仍然带有较强的实验口径依赖。",
+        "第三，部分工作已经开始引入视觉上下文或元推理评测，这拓展了问题边界，但也让传统 GSM8K 分数更难承担统一比较尺度的角色。",
+        "第四，这批论文普遍强化了对推理过程的重视，但对过程可解释性、可验证性和可迁移性的讨论仍然不够充分。",
+        "因此，后续更有价值的综述写法，不应只汇总谁的准确率更高，而应系统回答：哪些方法在修复理解错误，哪些方法在修复推理错误，哪些方法在修复评测缺陷。",
     ]
     return "\n".join(
         [
@@ -455,25 +519,34 @@ def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path, req
             "",
             *synthesis_lines,
             "",
-            "## 四、逐篇综述",
+            "## 四、研究问题的进一步分层",
+            "",
+            *stratification_lines,
+            "",
+            "## 五、逐篇深入综述",
             "",
             *per_paper_lines,
-            "## 五、横向比较与综合讨论",
+            "## 六、横向比较与综合讨论",
             "",
             *compare_lines,
             "",
-            "## 六、现阶段的共性不足与后续方向",
+            "## 七、基于实验线索的进一步比较",
+            "",
+            *evidence_compare_lines,
+            "",
+            "## 八、现阶段的共性不足与后续方向",
             "",
             *gap_lines,
             "",
-            "## 七、写作建议",
+            "## 九、扩写建议",
             "",
-            "如果后续要继续扩写这篇综述，建议把现有 `paper_notes/` 中的规范化笔记作为底稿，再回到每篇论文全文中补齐：",
+            "如果后续要继续扩写这篇综述，建议把现有 `paper_notes/` 中的规范化笔记作为底稿，再回到每篇论文全文中补齐以下信息，再做正式写作：",
             "1. 任务设定与输入输出形式。",
             "2. 模型或方法的关键创新点。",
             "3. 数据集、评价指标、基线模型。",
             "4. 作者明确指出的局限性与未来工作。",
-            "这样可以把当前这版自动生成的中文综述，进一步扩成一篇更完整、可发表或可汇报的研究综述。",
+            "5. 与其他论文在误差类型、验证机制和推理链控制上的直接对应关系。",
+            "这样可以把当前这版自动生成的中文综述，进一步扩成一篇更完整、更有论证深度的研究综述。",
             "",
         ]
     )
@@ -542,6 +615,8 @@ def build_summary_html(keyword: str, papers: list[Paper], requested_limit: int) 
   </main>
 </body>
 </html>"""
+
+
 def run(keyword: str, limit: int, output_root: Path, max_results: int) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = output_root / f"{safe_name(keyword)}_{timestamp}"
