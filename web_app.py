@@ -839,6 +839,29 @@ def update_task(task_id: str, **changes) -> None:
     save_tasks_to_disk()
 
 
+def recent_task_logs(task_id: str) -> List[str]:
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return []
+        return list(task.get("logs", []))
+
+
+def explain_command_failure(task_id: str, fallback: str) -> str:
+    ignore_patterns = (
+        "RequestsDependencyWarning",
+        "warnings.warn(",
+    )
+    for line in reversed(recent_task_logs(task_id)):
+        text = str(line or "").strip()
+        if not text:
+            continue
+        if any(pattern in text for pattern in ignore_patterns):
+            continue
+        return text
+    return fallback
+
+
 def list_tasks_payload(limit: int = 24) -> List[Dict]:
     with TASKS_LOCK:
         tasks = list(TASKS.values())
@@ -1399,7 +1422,7 @@ def run_arxiv_title_survey_job(task_id: str, keyword: str, limit: int, max_resul
     ]
     code = run_command_stream(task_id, cmd, "正在抓取 arXiv 标题匹配论文", 5)
     if code != 0:
-        raise RuntimeError("arXiv 论文抓取失败，请检查日志。")
+        raise RuntimeError(explain_command_failure(task_id, "arXiv 论文抓取失败，请检查日志。"))
 
     after = {p.name for p in output_root.iterdir() if p.is_dir()}
     created = sorted(after - before)
