@@ -96,8 +96,10 @@ class PartialCorpusTests(unittest.TestCase):
             self.assertIn('"requested_limit": 10', manifest)
             self.assertIn('"actual_count": 1', manifest)
             survey = (run_dir / "survey.md").read_text(encoding="utf-8")
-            self.assertIn("- Requested corpus size: 10 papers", survey)
-            self.assertIn("- Actual corpus size: 1 papers", survey)
+            self.assertIn("- 请求篇数：10", survey)
+            self.assertIn("- 实际篇数：1", survey)
+            self.assertIn("# 关于“gsm8k”相关 arXiv 论文的中文综述", survey)
+            self.assertIn("## 四、逐篇综述", survey)
 
 
 if __name__ == "__main__":

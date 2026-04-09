@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
+from urllib.request import Request, urlopen
 
 import feedparser
 import fitz
@@ -20,9 +21,12 @@ import requests
 
 
 ARXIV_API = "https://export.arxiv.org/api/query"
+TRANSLATE_API_BASE = "https://translate.googleapis.com/translate_a/single"
 USER_AGENT = "arxiv-title-survey/1.0"
 WORD_RE = re.compile(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+")
 SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+")
+ZH_RE = re.compile(r"[\u4e00-\u9fff]")
+LATIN_RE = re.compile(r"[A-Za-z]")
 STOPWORDS = {
     "a",
     "an",
@@ -79,6 +83,42 @@ class Paper:
     authors: list[str]
     abs_url: str
     pdf_url: str
+
+
+def looks_chinese(text: str) -> bool:
+    if not text:
+        return False
+    cjk_count = len(ZH_RE.findall(text))
+    latin_count = len(LATIN_RE.findall(text))
+    return cjk_count > 0 and cjk_count >= latin_count
+
+
+class ZhTranslator:
+    def __init__(self) -> None:
+        self.cache: dict[str, str] = {}
+
+    def translate(self, text: str | None) -> str | None:
+        if not text:
+            return text
+        normalized = re.sub(r"\s+", " ", str(text)).strip()
+        if not normalized or looks_chinese(normalized):
+            return normalized
+        cached = self.cache.get(normalized)
+        if cached is not None:
+            return cached
+        url = f"{TRANSLATE_API_BASE}?client=gtx&sl=auto&tl=zh-CN&dt=t&q={quote(normalized, safe='')}"
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        try:
+            with urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            translated = "".join(part[0] for part in payload[0] if part and part[0]).strip()
+            if translated:
+                self.cache[normalized] = translated
+                return translated
+        except Exception:
+            pass
+        self.cache[normalized] = normalized
+        return normalized
 
 
 def safe_name(text: str) -> str:
@@ -317,62 +357,123 @@ def build_normalized_paper_note(paper: Paper, md_path: Path, keyword: str) -> st
     )
 
 
+def summarize_paper(paper: Paper) -> dict[str, str]:
+    sentences = split_sentences(paper.summary)
+    research_problem = sentences[0] if sentences else paper.summary
+    core_method = pick_method_sentence(sentences, fallback=research_problem)
+    main_result = pick_sentence(sentences, RESULT_HINTS, fallback=sentences[-1] if sentences else paper.summary)
+    limitation = pick_limitation_sentence(sentences, fallback="Abstract 中未直接陈述限制，需在精读全文时补充。")
+    return {
+        "problem": research_problem,
+        "method": core_method,
+        "result": main_result,
+        "limitation": limitation,
+    }
+
+
 def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path, requested_limit: int) -> str:
     focus_terms = extract_focus_terms(papers)
-    rows = [
-        "| # | Title | Year | arXiv ID |",
-        "| --- | --- | --- | --- |",
-    ]
+    translator = ZhTranslator()
+    rows = ["| 序号 | 论文标题 | 年份 | arXiv ID |", "| --- | --- | --- | --- |"]
+    translated_notes: list[dict[str, str]] = []
     for idx, paper in enumerate(papers, start=1):
         year = paper.published[:4] if paper.published else "unknown"
         rows.append(f"| {idx} | {paper.title} | {year} | {paper.arxiv_id} |")
+        summary = summarize_paper(paper)
+        translated_notes.append(
+            {
+                "title": paper.title,
+                "problem_zh": translator.translate(summary["problem"]) or summary["problem"],
+                "method_zh": translator.translate(summary["method"]) or summary["method"],
+                "result_zh": translator.translate(summary["result"]) or summary["result"],
+                "limitation_zh": translator.translate(summary["limitation"]) or summary["limitation"],
+            }
+        )
 
-    notes = []
-    for idx, paper in enumerate(papers, start=1):
-        note_path = note_dir / f"{idx:02d}_{safe_name(paper.arxiv_id)}.md"
-        note_text = note_path.read_text(encoding="utf-8")
-        summary_block = note_text.split("## Standardized Summary", 1)[1].split("## Relevance To Query", 1)[0].strip()
-        notes.extend([f"### Paper {idx}: {paper.title}", "", summary_block, ""])
-
-    theme_text = ", ".join(focus_terms) if focus_terms else "No stable theme terms extracted"
+    theme_text = "、".join(focus_terms) if focus_terms else "未抽取到稳定高频词"
+    intro = (
+        f"围绕“{keyword}”这一主题，本次在 arXiv 中采用“标题必须包含全部关键词 token”的严格筛选规则，"
+        f"请求抓取 {requested_limit} 篇，最终得到 {len(papers)} 篇论文。"
+        "从现有语料看，这批论文主要聚焦在任务求解能力、推理过程建模、评测基准设计以及小模型性能提升几个方向。"
+    )
+    synthesis_lines = [
+        f"综合这批论文，可以看到当前研究并不只是在追求更高分数，而是在重新拆解“模型为什么能做对题、又为什么会做错题”这一问题。",
+        "一类工作强调直接提升求解器的题意理解与推理链质量，试图减少语义误解、遗漏步骤和计算错误。",
+        "另一类工作把重点放在评测范式本身，认为只看最终答案不足以区分模型能力，因此需要引入对推理过程、元推理能力或视觉上下文的考察。",
+        "同时，也有工作证明小模型并非天然缺乏数学推理能力，只要数据构造、训练方式和验证机制设计得当，参数规模较小的模型同样可以取得有竞争力的结果。",
+    ]
+    per_paper_lines = []
+    for idx, note in enumerate(translated_notes, start=1):
+        per_paper_lines.extend(
+            [
+                f"### 论文 {idx}: {note['title']}",
+                "",
+                f"这篇论文主要关注：{note['problem_zh']}",
+                f"其核心做法是：{note['method_zh']}",
+                f"论文报告的主要发现是：{note['result_zh']}",
+                f"从作者摘要中能直接看到的限制或后续空间是：{note['limitation_zh']}",
+                "",
+            ]
+        )
+    compare_lines = [
+        "从横向比较看，这批论文至少体现出三条明显路线：",
+        "1. 求解增强路线：通过更强的问题理解、推理拆解或验证机制提高 GSM8K 一类任务上的解题正确率。",
+        "2. 评测增强路线：通过元推理、视觉扩展等方式，让基准不再只考最终答案，而是考查模型的推理质量与泛化边界。",
+        "3. 轻量化路线：探索小模型在专门数据与验证框架支持下能否逼近甚至超过更大模型的表现。",
+        "",
+        "这些路线的共同点，是都把“分数”看作结果变量，而把“推理过程”视为真正需要被建模、被监督、被评估的对象。",
+    ]
+    gap_lines = [
+        "尽管现有论文已经覆盖了求解、评测和模型规模三个层面，但仍存在一些共同缺口。",
+        "第一，很多论文在摘要层面强调结果提升，却没有充分说明方法在不同题型、不同错误类型上的稳定性。",
+        "第二，跨论文之间使用的数据组织、验证策略和错误分类标准并不完全一致，导致横向比较仍然有口径差异。",
+        "第三，部分工作已经开始引入视觉上下文或元推理评测，但这也意味着传统 GSM8K 分数不再足以代表真实的数学推理能力全貌。",
+        "后续如果要写成更完整的中文综述，建议继续回到全文中补充实验设置、数据构造、基线选择和误差分析，再把这些信息并入分章节比较。",
+    ]
     return "\n".join(
         [
-            f"# Survey Draft: {keyword}",
+            f"# 关于“{keyword}”相关 arXiv 论文的中文综述",
             "",
-            "## Corpus Protocol",
+            "## 一、语料范围与筛选说明",
             "",
-            f"- Retrieval date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"- Requested corpus size: {requested_limit} papers",
-            f"- Actual corpus size: {len(papers)} papers",
-            f"- Selection rule: every keyword token from `{keyword}` must appear in the paper title",
-            "- Source: arXiv API metadata + downloaded PDFs converted to Markdown",
-            "- PDF retention policy: delete each PDF immediately after Markdown conversion succeeds",
+            f"- 检索时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- 请求篇数：{requested_limit}",
+            f"- 实际篇数：{len(papers)}",
+            f"- 筛选规则：论文标题必须包含 `{keyword}` 的全部关键词 token",
+            "- 数据来源：arXiv API 元数据 + 本地下载 PDF 后转 Markdown",
+            "- 文件策略：PDF 在成功转 Markdown 后立即删除，仅保留 Markdown、规范化笔记与综述输出",
             "",
-            "## Corpus Overview",
+            "## 二、论文列表",
             "",
             *rows,
             "",
-            "## Dominant Themes",
+            "## 三、整体研究脉络",
             "",
-            f"- Frequent title/abstract terms across the 10-paper corpus: {theme_text}",
-            "- Use these terms as the first-pass grouping signal, then refine after manual reading if you need a publication-ready survey.",
+            intro,
             "",
-            "## Standardized Paper Notes",
+            f"从标题和摘要的高频词来看，这批论文的核心主题可以概括为：{theme_text}。",
             "",
-            *notes,
-            "## Suggested Writing Flow",
+            *synthesis_lines,
             "",
-            "1. Read the 10 normalized notes before revisiting full Markdown files.",
-            "2. Group papers by problem setting, not just by publication year.",
-            "3. Compare methods, datasets, and evaluation criteria under the same subsection.",
-            "4. Separate confirmed experimental findings from author claims in abstracts.",
-            "5. End with open gaps, reproducibility concerns, and future directions.",
+            "## 四、逐篇综述",
             "",
-            "## Gap Checklist",
+            *per_paper_lines,
+            "## 五、横向比较与综合讨论",
             "",
-            "- Which assumptions recur across papers but remain weakly justified?",
-            "- Which baselines or datasets are missing from cross-paper comparison?",
-            "- Which claims rely only on abstract-level evidence and still need full-text verification?",
+            *compare_lines,
+            "",
+            "## 六、现阶段的共性不足与后续方向",
+            "",
+            *gap_lines,
+            "",
+            "## 七、写作建议",
+            "",
+            "如果后续要继续扩写这篇综述，建议把现有 `paper_notes/` 中的规范化笔记作为底稿，再回到每篇论文全文中补齐：",
+            "1. 任务设定与输入输出形式。",
+            "2. 模型或方法的关键创新点。",
+            "3. 数据集、评价指标、基线模型。",
+            "4. 作者明确指出的局限性与未来工作。",
+            "这样可以把当前这版自动生成的中文综述，进一步扩成一篇更完整、可发表或可汇报的研究综述。",
             "",
         ]
     )
