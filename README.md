@@ -17,6 +17,28 @@
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License" />
 </p>
 
+## 中文说明
+
+Social Radar 是一个本地优先的研究与情报工作台，用来把 X / Folo / 知乎 / 小红书 / arXiv 的内容整理成可读、可分享、可继续加工的报告。
+
+当前内置能力包括：
+
+- 按关键词抓取 X，并生成排序页、文章页和中文整理结果
+- 抓取关注流、博主历史推文、博主关注列表
+- 抓取知乎问题回答、知乎搜索结果、知乎用户动态
+- 抓取小红书博主笔记和搜索结果全文
+- 抓取 Folo 时间线并生成摘要页
+- 从 arXiv 抓取标题严格匹配关键词的论文，PDF 转 Markdown 后立即删除 PDF，并自动生成中文综述草稿
+
+本地网页控制台 `web_app.py` 已支持直接运行 arXiv 流程：
+
+- 输入关键词
+- 默认目标抓取 10 篇，若不足 10 篇则按实际篇数继续输出
+- 输出 `summary.html`、`survey.md`、`manifest.json`、`papers_md/`、`paper_notes/`
+- `survey.md` 会生成一篇面向已抓取论文的中文综述，而不是简单摘要拼接
+
+下面是英文版 README。
+
 ## What it does
 
 Social Radar turns noisy public content into something you can actually read and reuse.
@@ -27,8 +49,11 @@ Social Radar turns noisy public content into something you can actually read and
 - Pull all activities from a Zhihu user profile, including answer/article/pin/video links and full text exports
 - Pull Xiaohongshu note lists, full text, images, and comments
 - Pull Folo timeline data with your own cookie inside the same web console
+- Pull arXiv papers whose titles strictly match your keyword, convert PDFs to Markdown, delete PDFs, and generate a Chinese survey draft
 - Track progress in a local web console instead of staring at terminal logs
 - Persist tasks locally so history survives page refreshes and service restarts
+- Send generated reports as attachments with one-click batch email from the same web console
+- Publish generated HTML / CSV / JSON outputs to GitHub with a plain `git add && git commit && git push` workflow
 - Highlight the most actionable efficiency posts and the most research-inspiring AI posts
 - Explain why each highlighted item matters in Chinese inside the ranking page
 
@@ -203,6 +228,26 @@ python folo_fetch.py --cookie "<your cookie>" --view 0 --limit 20
 
 If you set `--limit 50`, the fetcher now requests more than one page when needed instead of stopping at the API's default first page size.
 
+### 8. arXiv title-matched survey workflow
+
+```bash
+python arxiv_title_survey.py "gsm8k" --limit 10
+```
+
+Output:
+
+- `papers_md/`: one Markdown file per paper
+- `paper_notes/`: normalized reading notes per paper
+- `survey.md`: a Chinese survey draft written over the retrieved paper set
+- `summary.html`: a browser-friendly index page
+- `manifest.json`: retrieval metadata and actual corpus size
+
+Rules:
+
+- every keyword token must appear in the paper title
+- PDFs are deleted immediately after Markdown conversion succeeds
+- if fewer than 10 papers match, the workflow continues with the actual count instead of failing
+
 ## Web console features
 
 The local console in `web_app.py` is the main product surface.
@@ -214,7 +259,9 @@ The local console in `web_app.py` is the main product surface.
 - stop running tasks
 - persist task metadata to disk
 - run Folo timeline fetches from the same dashboard
+- run arXiv title-matched survey generation from the same dashboard
 - run Zhihu user activity exports from the same dashboard
+- save SMTP settings locally and send report attachments in bulk with one click
 
 Removed integrations:
 
@@ -234,6 +281,36 @@ This makes the report more useful as a review surface, not just a dump of high-s
 
 For a repo like this, the console matters more than the crawler scripts. People star products, not script folders.
 
+## Delivery workflows
+
+### One-click batch email
+
+The web console includes a built-in mailer panel.
+
+- configure `SMTP host / port / security / username / password`
+- save the config locally to `output/.web_mailer.json`
+- pick a generated run directory
+- select `summary.html`, `article.html`, CSV, JSON, or other generated files as attachments
+- send the report to one or many recipients in one batch
+
+This is useful when you want to deliver the same intelligence pack directly to clients, teammates, or subscribers without leaving the console.
+
+### Push outputs to GitHub
+
+Generated outputs are normal local files, so they can be versioned and published with standard Git commands:
+
+```bash
+git add output/
+git commit -m "Add latest intelligence reports"
+git push origin main
+```
+
+Typical use cases:
+
+- push reports to a private GitHub repo for team review
+- publish HTML outputs via GitHub Pages
+- keep CSV / JSON snapshots under version control for later comparison
+
 ## Project structure
 
 ```text
@@ -251,6 +328,7 @@ For a repo like this, the console matters more than the crawler scripts. People 
 ├── xiaohongshu_search_keyword_500.py
 ├── xiaohongshu_user_notes.py
 ├── folo_fetch.py
+├── arxiv_title_survey.py
 ├── rank_usefulness.py
 ├── html_report.py
 └── assets/
