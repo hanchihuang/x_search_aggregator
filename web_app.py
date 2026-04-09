@@ -27,6 +27,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
+ARXIV_SURVEY_OUTPUT_DIR = OUTPUT_DIR / "arxiv_title_surveys"
 TASKS_DB_PATH = BASE_DIR / "output" / ".web_tasks.json"
 MAILER_DB_PATH = BASE_DIR / "output" / ".web_mailer.json"
 DEFAULT_STATE = "auth_state_cookie.json"
@@ -277,6 +278,8 @@ def run_report_files(run_dir: Path) -> List[Dict]:
         ("价值排序页", run_dir / "usefulness_ranking.html"),
         ("深度文章页", run_dir / "article.html"),
         ("摘要页", run_dir / "summary.html"),
+        ("Survey Markdown", run_dir / "survey.md"),
+        ("语料清单", run_dir / "manifest.json"),
         ("区间中文 HTML", run_dir / "selected_zh.html"),
         ("知乎回答全文", run_dir / "all_answers.md"),
         ("知乎搜索全文", run_dir / "all_results.md"),
@@ -521,9 +524,27 @@ def run_email_job(task_id: str, params: Dict) -> None:
 def list_run_dirs(limit: int = 12) -> List[Path]:
     if not OUTPUT_DIR.exists():
         return []
-    dirs = [p for p in OUTPUT_DIR.iterdir() if p.is_dir()]
+    dirs: List[Path] = []
+    for path in OUTPUT_DIR.rglob("*"):
+        if not path.is_dir():
+            continue
+        try:
+            depth = len(path.relative_to(OUTPUT_DIR).parts)
+        except ValueError:
+            continue
+        if depth > 2:
+            continue
+        if run_report_files(path):
+            dirs.append(path)
     dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return dirs[:limit]
+
+
+def display_run_name(run_dir: Path) -> str:
+    try:
+        return run_dir.resolve().relative_to(OUTPUT_DIR.resolve()).as_posix()
+    except ValueError:
+        return run_dir.name
 
 
 def resolve_report_links(run_dir: Path) -> List[Tuple[str, str]]:
@@ -644,7 +665,7 @@ def recent_runs_payload() -> List[Dict]:
         files = run_report_files(run_dir)
         payload.append(
             {
-                "name": run_dir.name,
+                "name": display_run_name(run_dir),
                 "updated_at": datetime.fromtimestamp(run_dir.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
                 "links": [{"label": item["label"], "url": item["url"]} for item in files],
                 "files": [{"label": item["label"], "name": item["name"]} for item in files],
@@ -1000,7 +1021,7 @@ def task_payload(task_id: str) -> Dict:
             "message": task["message"],
             "error": task["error"],
             "logs": "\n".join(task["logs"]),
-            "result_dir": run_dir.name if run_dir else "",
+            "result_dir": display_run_name(run_dir) if run_dir else "",
             "result_links": result_links,
             "cancel_requested": task.get("cancel_requested", False),
             "target_items": task.get("target_items", 0),
@@ -1361,6 +1382,43 @@ def run_folo_job(task_id: str, cookie: str, view: int, limit: int) -> None:
     )
 
 
+def run_arxiv_title_survey_job(task_id: str, keyword: str, limit: int, max_results: int) -> None:
+    output_root = ARXIV_SURVEY_OUTPUT_DIR
+    before = {p.name for p in output_root.iterdir() if p.is_dir()} if output_root.exists() else set()
+    output_root.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        "arxiv_title_survey.py",
+        keyword,
+        "--limit",
+        str(limit),
+        "--max-results",
+        str(max_results),
+        "--output-root",
+        str(output_root),
+    ]
+    code = run_command_stream(task_id, cmd, "正在抓取 arXiv 标题匹配论文", 5)
+    if code != 0:
+        raise RuntimeError("arXiv 论文抓取失败，请检查日志。")
+
+    after = {p.name for p in output_root.iterdir() if p.is_dir()}
+    created = sorted(after - before)
+    run_dir = (output_root / created[-1]) if created else None
+    if run_dir is None or not run_dir.exists():
+        candidates = sorted([p for p in output_root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+        run_dir = candidates[0] if candidates else None
+    if run_dir is None:
+        raise RuntimeError("arXiv 任务完成，但未找到输出目录。")
+
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"arXiv 标题严格匹配 survey 已完成：{keyword}（{limit} 篇）",
+        stage="已完成",
+        progress=100,
+    )
+
+
 def worker(task_id: str) -> None:
     update_task(task_id, status="running", stage="准备启动", progress=2)
     try:
@@ -1446,6 +1504,13 @@ def worker(task_id: str) -> None:
                 params["cookie"],
                 int(params.get("view", 0)),
                 int(params.get("limit", 20)),
+            )
+        elif task["type"] == "arxiv_title_survey":
+            run_arxiv_title_survey_job(
+                task_id,
+                params["keyword"],
+                int(params.get("limit", 10)),
+                int(params.get("max_results", 100)),
             )
         else:
             run_email_job(task_id, params)
@@ -1842,8 +1907,8 @@ def render_page() -> str:
 <body>
   <main class="wrap">
     <header class="hero">
-      <h1>X / Folo 抓取控制台</h1>
-      <p>提交任务后会在后台执行。右侧面板会自动刷新状态、进度和日志，完成后直接点开生成的 HTML。</p>
+      <h1>X / Folo / arXiv 抓取控制台</h1>
+      <p>提交任务后会在后台执行。右侧面板会自动刷新状态、进度和日志，完成后直接点开生成的 HTML 或 Markdown。</p>
     </header>
 
     <section class="layout">
@@ -1916,6 +1981,22 @@ def render_page() -> str:
           </label>
           <div class="mini-note">最终会生成一个联合输出目录，里面包含总览页和 X / 知乎两个子任务的结果链接。</div>
           <button class="btn alt" type="submit">开始联合搜索</button>
+        </form>
+
+        <form class="panel js-task-form" data-kind="arxiv_title_survey">
+          <h2>抓取 arXiv 标题严格匹配论文并生成 survey</h2>
+          <p>只保留标题中包含查询关键词全部 token 的论文。系统会抓 10 篇 PDF，转 Markdown 后立即删除 PDF，再为 10 篇 Markdown 生成规范化笔记和 survey 草稿。</p>
+          <label>关键词
+            <input type="text" name="keyword" placeholder="例如 transformer / multi agent / retrieval augmented generation" required />
+          </label>
+          <label>论文数量
+            <input type="text" name="limit" value="10" />
+          </label>
+          <label>候选池上限
+            <input type="text" name="max_results" value="100" />
+          </label>
+          <div class="mini-note">搜索规则固定为标题字段严格匹配。输出目录会包含 `summary.html`、`survey.md`、`manifest.json`、`papers_md/` 和 `paper_notes/`；PDF 在转换成功后立即删除。</div>
+          <button class="btn" type="submit">开始抓取 arXiv Survey</button>
         </form>
 
         <form class="panel js-task-form" data-kind="following">
@@ -2448,6 +2529,7 @@ def render_page() -> str:
       const endpointMap = {
         keyword: "/api/tasks/keyword",
         x_zhihu_search: "/api/tasks/x-zhihu-search",
+        arxiv_title_survey: "/api/tasks/arxiv-title-survey",
         following: "/api/tasks/following",
         user_timeline: "/api/tasks/user-timeline",
         user_following: "/api/tasks/user-following",
@@ -2657,6 +2739,31 @@ def api_task_x_zhihu_search():
             "zhihu_user_agent": (request.form.get("zhihu_user_agent") or "").strip(),
             "headless": request.form.get("headless") == "1",
             "hydrate_fulltext": request.form.get("hydrate_fulltext") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/arxiv-title-survey")
+def api_task_arxiv_title_survey():
+    keyword = (request.form.get("keyword") or "").strip()
+    if not keyword:
+        return jsonify({"error": "关键词不能为空。"}), 400
+    try:
+        limit = int((request.form.get("limit") or "10").strip() or "10")
+        max_results = int((request.form.get("max_results") or "100").strip() or "100")
+    except ValueError:
+        return jsonify({"error": "论文数量和候选池上限必须是整数。"}), 400
+    if limit <= 0:
+        return jsonify({"error": "论文数量必须大于 0。"}), 400
+    if max_results <= 0:
+        return jsonify({"error": "候选池上限必须大于 0。"}), 400
+    task_id = start_task(
+        "arxiv_title_survey",
+        {
+            "keyword": keyword,
+            "limit": limit,
+            "max_results": max_results,
         },
     )
     return jsonify({"task_id": task_id})
