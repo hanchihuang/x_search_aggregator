@@ -317,7 +317,7 @@ def build_normalized_paper_note(paper: Paper, md_path: Path, keyword: str) -> st
     )
 
 
-def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path) -> str:
+def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path, requested_limit: int) -> str:
     focus_terms = extract_focus_terms(papers)
     rows = [
         "| # | Title | Year | arXiv ID |",
@@ -342,7 +342,8 @@ def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path) -> 
             "## Corpus Protocol",
             "",
             f"- Retrieval date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"- Corpus size: {len(papers)} papers",
+            f"- Requested corpus size: {requested_limit} papers",
+            f"- Actual corpus size: {len(papers)} papers",
             f"- Selection rule: every keyword token from `{keyword}` must appear in the paper title",
             "- Source: arXiv API metadata + downloaded PDFs converted to Markdown",
             "- PDF retention policy: delete each PDF immediately after Markdown conversion succeeds",
@@ -377,7 +378,7 @@ def build_survey_markdown(keyword: str, papers: list[Paper], note_dir: Path) -> 
     )
 
 
-def build_summary_html(keyword: str, papers: list[Paper], run_dir: Path) -> str:
+def build_summary_html(keyword: str, papers: list[Paper], requested_limit: int) -> str:
     cards: list[str] = []
     for idx, paper in enumerate(papers, start=1):
         base_name = f"{idx:02d}_{safe_name(paper.arxiv_id)}.md"
@@ -430,7 +431,7 @@ def build_summary_html(keyword: str, papers: list[Paper], run_dir: Path) -> str:
   <main>
     <section class="hero">
       <h1>{html.escape(keyword)} · arXiv 标题严格匹配 Survey</h1>
-      <p>该语料只保留标题中包含查询关键词全部 token 的论文。每篇 PDF 在成功转成 Markdown 后立即删除，当前目录保留论文 Markdown、规范化笔记和 survey 草稿。</p>
+      <p>该语料只保留标题中包含查询关键词全部 token 的论文。请求篇数 {requested_limit}，实际返回 {len(papers)}。每篇 PDF 在成功转成 Markdown 后立即删除，当前目录保留论文 Markdown、规范化笔记和 survey 草稿。</p>
       <div class="top-links">
         <a href="survey.md" target="_blank" rel="noreferrer">打开 survey.md</a>
         <a href="manifest.json" target="_blank" rel="noreferrer">打开 manifest.json</a>
@@ -440,15 +441,6 @@ def build_summary_html(keyword: str, papers: list[Paper], run_dir: Path) -> str:
   </main>
 </body>
 </html>"""
-
-
-def ensure_limit(papers: list[Paper], limit: int, keyword: str) -> None:
-    if len(papers) < limit:
-        raise SystemExit(
-            f"只找到 {len(papers)} 篇满足条件的 arXiv 论文。当前规则要求标题必须包含 `{keyword}` 的全部关键词，未达到 {limit} 篇。"
-        )
-
-
 def run(keyword: str, limit: int, output_root: Path, max_results: int) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = output_root / f"{safe_name(keyword)}_{timestamp}"
@@ -461,11 +453,16 @@ def run(keyword: str, limit: int, output_root: Path, max_results: int) -> Path:
     note_dir.mkdir(parents=True, exist_ok=True)
 
     papers = fetch_arxiv_papers(keyword, limit=limit, max_results=max_results)
-    ensure_limit(papers, limit, keyword)
+    actual_count = len(papers)
+    if actual_count == 0:
+        raise SystemExit(f"没有找到标题包含 `{keyword}` 全部关键词的 arXiv 论文。")
+    if actual_count < limit:
+        print(f"只找到 {actual_count} 篇满足条件的论文，低于请求的 {limit} 篇；将按实际篇数继续生成输出。")
 
     manifest = {
         "keyword": keyword,
-        "limit": limit,
+        "requested_limit": limit,
+        "actual_count": actual_count,
         "selection_rule": "all keyword tokens must appear in title",
         "generated_at": datetime.now().isoformat(),
         "papers": [],
@@ -476,9 +473,9 @@ def run(keyword: str, limit: int, output_root: Path, max_results: int) -> Path:
         pdf_path = pdf_dir / f"{base_name}.pdf"
         md_path = md_dir / f"{base_name}.md"
         note_path = note_dir / f"{base_name}.md"
-        print(f"[{idx}/{limit}] 下载 PDF: {paper.title}")
+        print(f"[{idx}/{actual_count}] 下载 PDF: {paper.title}")
         download_pdf(paper.pdf_url, pdf_path)
-        print(f"[{idx}/{limit}] 转 Markdown 并删除 PDF: {paper.arxiv_id}")
+        print(f"[{idx}/{actual_count}] 转 Markdown 并删除 PDF: {paper.arxiv_id}")
         convert_pdf_and_delete(pdf_path, md_path, paper)
         note_path.write_text(build_normalized_paper_note(paper, md_path, keyword), encoding="utf-8")
         manifest["papers"].append(
@@ -495,8 +492,8 @@ def run(keyword: str, limit: int, output_root: Path, max_results: int) -> Path:
         )
 
     survey_path = run_dir / "survey.md"
-    survey_path.write_text(build_survey_markdown(keyword, papers, note_dir), encoding="utf-8")
-    (run_dir / "summary.html").write_text(build_summary_html(keyword, papers, run_dir), encoding="utf-8")
+    survey_path.write_text(build_survey_markdown(keyword, papers, note_dir, limit), encoding="utf-8")
+    (run_dir / "summary.html").write_text(build_summary_html(keyword, papers, limit), encoding="utf-8")
     (run_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     try:
