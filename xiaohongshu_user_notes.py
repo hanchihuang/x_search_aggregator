@@ -14,7 +14,7 @@ from typing import Dict, Iterable, List, Tuple
 
 from playwright.sync_api import TimeoutError, sync_playwright
 
-from browser_config import get_browser_args
+from browser_config import get_browser_args, get_playwright_launch_kwargs
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -635,7 +635,7 @@ def main() -> int:
     print(f"Profile URL: {profile_url}")
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=args.headless, args=get_browser_args())
+        browser = pw.chromium.launch(**get_playwright_launch_kwargs(headless=args.headless))
         context = browser.new_context(
             user_agent=args.user_agent,
             viewport={"width": 1440, "height": 1100},

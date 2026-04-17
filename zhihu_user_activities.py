@@ -17,7 +17,7 @@ from urllib import request as urlrequest
 
 from playwright.sync_api import TimeoutError, sync_playwright
 
-from browser_config import get_browser_args
+from browser_config import get_browser_args, get_playwright_launch_kwargs
 from zhihu_question_answers import (
     DEFAULT_USER_AGENT,
     click_expand_buttons,
@@ -411,7 +411,7 @@ def crawl_user_activities(
     }
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=browser_args)
+        browser = p.chromium.launch(**get_playwright_launch_kwargs(headless=headless, args=browser_args))
         context = browser.new_context(
             user_agent=user_agent,
             viewport={"width": 1280, "height": 900},
@@ -496,7 +496,7 @@ def crawl_user_activities(
         print("\n开始获取完整内容...")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless, args=browser_args)
+            browser = p.chromium.launch(**get_playwright_launch_kwargs(headless=headless, args=browser_args))
             context = browser.new_context(
                 user_agent=user_agent,
                 viewport={"width": 1280, "height": 900},

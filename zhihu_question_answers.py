@@ -17,7 +17,7 @@ from urllib import request as urlrequest
 
 from playwright.sync_api import TimeoutError, sync_playwright
 
-from browser_config import get_browser_args
+from browser_config import get_browser_args, get_playwright_launch_kwargs
 
 QUESTION_URL_RE = re.compile(r"^https?://www\.zhihu\.com/question/(\d+)(?:[/?#].*)?$")
 ANSWER_URL_RE = re.compile(r"https?://www\.zhihu\.com/question/(\d+)/answer/(\d+)")
@@ -645,7 +645,7 @@ def main() -> int:
     print(f"Question URL: {question_url}")
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=args.headless, args=get_browser_args())
+        browser = pw.chromium.launch(**get_playwright_launch_kwargs(headless=args.headless))
         context = browser.new_context(
             user_agent=args.user_agent,
             viewport={"width": 1440, "height": 1100},

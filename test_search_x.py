@@ -8,7 +8,7 @@ from playwright.sync_api import TimeoutError
 from search_keyword_500 import merge_items_with_network_recovery, navigate_with_retry, open_search_with_recovery
 from search_x import END_MARKER_SELECTORS, TWEET_SELECTORS, wait_for_search_results
 from tweet_fulltext import hydrate_items_with_fulltext
-from web_app import resolve_fulltext_stats
+from web_app import app, resolve_fulltext_stats
 
 
 class FakePage:
@@ -201,6 +201,41 @@ class WebAppFulltextStatsTests(unittest.TestCase):
             self.assertEqual(69, stats["fulltext_processed"])
             self.assertEqual(69, stats["fulltext_hydrated"])
             self.assertEqual(0, stats["fulltext_failed"])
+
+
+class WebAppPostCommentsTests(unittest.TestCase):
+    def setUp(self):
+        self.client = app.test_client()
+
+    def test_post_comments_route_rejects_invalid_numeric_fields(self):
+        response = self.client.post(
+            "/api/tasks/post-comments",
+            data={
+                "post_url": "https://x.com/karpathy/status/2036836816654147718",
+                "max_scrolls": "abc",
+            },
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("必须是整数", response.get_json()["error"])
+
+    def test_post_comments_route_creates_task(self):
+        with patch("web_app.start_task", return_value="task-post-1") as mocked_start:
+            response = self.client.post(
+                "/api/tasks/post-comments",
+                data={
+                    "post_url": "https://x.com/karpathy/status/2036836816654147718",
+                    "max_comments": "0",
+                    "max_scrolls": "10",
+                    "no_new_stop": "3",
+                    "scroll_pause": "1000",
+                },
+            )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertEqual("task-post-1", payload["task_id"])
+        mocked_start.assert_called_once()
 
 
 if __name__ == "__main__":

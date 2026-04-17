@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Browser configuration with anti-detection measures for X scraping."""
 
-from typing import Dict, Any
+from __future__ import annotations
+
+from shutil import which
+from typing import Any, Dict
 
 def get_browser_args() -> list:
     """Get browser arguments to reduce detection."""
@@ -41,3 +44,30 @@ def get_launch_options(headless: bool = False) -> Dict[str, Any]:
         "args": get_browser_args(),
         "ignore_default_args": ["--enable-automation"],
     }
+
+
+def find_system_chromium() -> str | None:
+    """Return a usable system Chromium/Chrome path when Playwright browsers are absent."""
+    for candidate in (
+        "chromium-browser",
+        "chromium",
+        "google-chrome",
+        "google-chrome-stable",
+    ):
+        resolved = which(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def get_playwright_launch_kwargs(headless: bool = False, args: list | None = None) -> Dict[str, Any]:
+    """Build Playwright launch kwargs with a system-browser fallback."""
+    launch_args = list(args if args is not None else get_browser_args())
+    launch_kwargs: Dict[str, Any] = {
+        "headless": headless,
+        "args": launch_args,
+    }
+    executable_path = find_system_chromium()
+    if executable_path:
+        launch_kwargs["executable_path"] = executable_path
+    return launch_kwargs

@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 from playwright.sync_api import sync_playwright
 
-from browser_config import get_browser_args
+from browser_config import get_browser_args, get_playwright_launch_kwargs
 from xiaohongshu_user_notes import (
     DEFAULT_USER_AGENT,
     detect_login_overlay,
@@ -459,7 +459,7 @@ def main() -> int:
     print(f"Search URL: {search_url}")
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=args.headless, args=get_browser_args())
+        browser = pw.chromium.launch(**get_playwright_launch_kwargs(headless=args.headless))
         context = browser.new_context(
             user_agent=args.user_agent,
             viewport={"width": 1440, "height": 1100},

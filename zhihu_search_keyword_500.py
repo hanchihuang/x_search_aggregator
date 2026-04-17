@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 from playwright.sync_api import TimeoutError, sync_playwright
 
-from browser_config import get_browser_args
+from browser_config import get_browser_args, get_playwright_launch_kwargs
 from zhihu_question_answers import (
     DEFAULT_USER_AGENT,
     click_expand_buttons,
@@ -409,7 +409,7 @@ def main() -> int:
     cookies = parse_cookie_string(args.cookie)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=args.headless, args=get_browser_args())
+        browser = pw.chromium.launch(**get_playwright_launch_kwargs(headless=args.headless))
         context = browser.new_context(
             user_agent=args.user_agent,
             viewport={"width": 1440, "height": 1100},
