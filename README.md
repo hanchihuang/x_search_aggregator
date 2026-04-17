@@ -25,6 +25,7 @@ Social Radar 是一个本地优先的研究与情报工作台，用来把 X / Fo
 
 - 按关键词抓取 X，并生成排序页、文章页和中文整理结果
 - 抓取关注流、博主历史推文、博主关注列表
+- 抓取指定 X 帖子详情页，自动下拉加载并保存原帖与全部评论
 - 抓取知乎问题回答、知乎搜索结果、知乎用户动态
 - 抓取小红书博主笔记和搜索结果全文
 - 抓取 Folo 时间线并生成摘要页
@@ -46,6 +47,7 @@ Social Radar turns noisy public content into something you can actually read and
 - Search X by keyword and export a clean HTML report
 - Crawl your following timeline and rank posts by usefulness
 - Pull full answers from Zhihu questions or keyword results
+- Pull one specific X post plus all loaded comments by scrolling the detail page
 - Pull all activities from a Zhihu user profile, including answer/article/pin/video links and full text exports
 - Pull Xiaohongshu note lists, full text, images, and comments
 - Pull Folo timeline data with your own cookie inside the same web console
@@ -169,6 +171,30 @@ python zhihu_question_answers.py \
   --cookie "<your cookie>"
 ```
 
+### 3.5. X 指定帖子与评论
+
+```bash
+python crawl_x_post_comments.py \
+  --post-url "https://x.com/karpathy/status/2036836816654147718" \
+  --state auth_state_cookie.json \
+  --cdp-url http://127.0.0.1:9222 \
+  --auto-launch
+```
+
+输出：
+
+- `post.json`
+- `comments.json`
+- `comments.csv`
+- `summary.md`
+- `article.html`
+
+说明：
+
+- 会在帖子详情页持续向下滚动，自动展开更多回复
+- `--max-comments 0` 表示尽量抓全当前可加载评论
+- 运行中会周期性 checkpoint，任务中断时也能保留已保存结果
+
 ### 4. Zhihu keyword top 500
 
 ```bash
@@ -253,6 +279,7 @@ Rules:
 The local console in `web_app.py` is the main product surface.
 
 - start tasks from the browser
+- support direct crawling of a specific X post and its comment thread
 - inspect task logs and progress
 - reopen historical runs
 - open generated HTML directly
@@ -319,6 +346,7 @@ Typical use cases:
 ├── login_x.py
 ├── search_keyword_500.py
 ├── search_x.py
+├── crawl_x_post_comments.py
 ├── crawl_following_timeline_500.py
 ├── crawl_user_timeline.py
 ├── crawl_user_following.py
