@@ -24,19 +24,31 @@ Social Radar 是一个本地优先的研究与情报工作台，用来把 X / Fo
 当前内置能力包括：
 
 - 按关键词抓取 X，并生成排序页、文章页和中文整理结果
+- 按同一个关键词联动抓取 X 与知乎，并生成一个联合总览页
 - 抓取关注流、博主历史推文、博主关注列表
 - 抓取指定 X 帖子详情页，自动下拉加载并保存原帖与全部评论
 - 抓取知乎问题回答、知乎搜索结果、知乎用户动态
 - 抓取小红书博主笔记和搜索结果全文
 - 抓取 Folo 时间线并生成摘要页
 - 从 arXiv 抓取标题严格匹配关键词的论文，PDF 转 Markdown 后立即删除 PDF，并自动生成中文综述草稿
+- 在同一个本地控制台里查看任务进度、历史结果，并把生成文件批量发邮件
 
-本地网页控制台 `web_app.py` 已支持直接运行 arXiv 流程：
+本地网页控制台 `web_app.py` 当前首页已内置这些入口：
 
-- 输入关键词
-- 默认目标抓取 10 篇，若不足 10 篇则按实际篇数继续输出
-- 输出 `summary.html`、`survey.md`、`manifest.json`、`papers_md/`、`paper_notes/`
-- `survey.md` 会生成一篇面向已抓取论文的中文综述，而不是简单摘要拼接
+- X 关键词搜索
+- X + 知乎联合关键词搜索
+- arXiv 标题严格匹配 survey
+- X 关注流
+- Folo 时间线
+- 知乎用户动态
+- X 博主历史推文
+- X 博主关注列表
+- 知乎问题回答
+- 知乎搜索前 500 条
+- 小红书博主全部笔记
+- 小红书搜索前 500 条
+- X 指定帖子与评论
+- SMTP 邮件批量发送
 
 下面是英文版 README。
 
@@ -45,6 +57,7 @@ Social Radar 是一个本地优先的研究与情报工作台，用来把 X / Fo
 Social Radar turns noisy public content into something you can actually read and reuse.
 
 - Search X by keyword and export a clean HTML report
+- Search the same keyword across X and Zhihu, then generate a combined overview page
 - Crawl your following timeline and rank posts by usefulness
 - Pull full answers from Zhihu questions or keyword results
 - Pull one specific X post plus all loaded comments by scrolling the detail page
@@ -149,6 +162,23 @@ Output:
 - usefulness ranking page
 - highlighted panels for "efficiency-first" and "AI research inspiration"
 - Chinese recommendation reasons for each highlighted post
+
+### 1.5. X + Zhihu combined keyword search
+
+This workflow is currently available from the local web console.
+
+Input:
+
+- one shared keyword
+- X auth state
+- Zhihu cookie and user-agent
+
+Output:
+
+- one combined output directory
+- `combined_overview.html`
+- `combined_manifest.json`
+- links to the generated X and Zhihu sub-runs
 
 ### 2. X following timeline ranking
 
@@ -279,15 +309,19 @@ Rules:
 The local console in `web_app.py` is the main product surface.
 
 - start tasks from the browser
+- run X keyword search and X + Zhihu combined search from the same page
 - support direct crawling of a specific X post and its comment thread
+- run X user timeline and X following-list crawls without leaving the dashboard
+- run Zhihu question, Zhihu search, and Zhihu user activity exports from the same dashboard
+- run Xiaohongshu user-note and keyword-search crawls from the same dashboard
 - inspect task logs and progress
 - reopen historical runs
+- auto-select the newest task and recover task details after refresh
 - open generated HTML directly
 - stop running tasks
 - persist task metadata to disk
 - run Folo timeline fetches from the same dashboard
 - run arXiv title-matched survey generation from the same dashboard
-- run Zhihu user activity exports from the same dashboard
 - save SMTP settings locally and send report attachments in bulk with one click
 
 Removed integrations:
