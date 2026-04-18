@@ -19,7 +19,7 @@
 
 ## 中文说明
 
-Social Radar 是一个本地优先的研究与情报工作台，用来把 X / Folo / 知乎 / 小红书 / arXiv 的内容整理成可读、可分享、可继续加工的报告。
+Social Radar 是一个本地优先的研究与情报工作台，用来把 X / Folo / 知乎 / 小红书 / arXiv / Consensus 的内容整理成可读、可分享、可继续加工的报告。
 
 当前内置能力包括：
 
@@ -31,6 +31,7 @@ Social Radar 是一个本地优先的研究与情报工作台，用来把 X / Fo
 - 抓取小红书博主笔记和搜索结果全文
 - 抓取 Folo 时间线并生成摘要页
 - 从 arXiv 抓取标题严格匹配关键词的论文，PDF 转 Markdown 后立即删除 PDF，并自动生成中文综述草稿
+- 对任意 Consensus 页面自动提取引用里的 DOI / arXiv / PDF 入口，并批量下载 PDF
 - 在同一个本地控制台里查看任务进度、历史结果，并把生成文件批量发邮件
 
 本地网页控制台 `web_app.py` 当前首页已内置这些入口：
@@ -38,6 +39,7 @@ Social Radar 是一个本地优先的研究与情报工作台，用来把 X / Fo
 - X 关键词搜索
 - X + 知乎联合关键词搜索
 - arXiv 标题严格匹配 survey
+- Consensus 引用 PDF 批量下载
 - X 关注流
 - Folo 时间线
 - 知乎用户动态
@@ -65,6 +67,7 @@ Social Radar turns noisy public content into something you can actually read and
 - Pull Xiaohongshu note lists, full text, images, and comments
 - Pull Folo timeline data with your own cookie inside the same web console
 - Pull arXiv papers whose titles strictly match your keyword, convert PDFs to Markdown, delete PDFs, and generate a Chinese survey draft
+- Open any Consensus page, extract citation-side DOI / arXiv / PDF targets, and batch-download the referenced PDFs
 - Track progress in a local web console instead of staring at terminal logs
 - Persist tasks locally so history survives page refreshes and service restarts
 - Send generated reports as attachments with one-click batch email from the same web console
@@ -307,6 +310,29 @@ Rules:
 - PDFs are deleted immediately after Markdown conversion succeeds
 - if fewer than 10 papers match, the workflow continues with the actual count instead of failing
 
+### 9. Consensus cited-PDF workflow
+
+This workflow is currently available from the local web console.
+
+Input:
+
+- one `consensus.app` page URL
+- optional Chrome CDP endpoint such as `http://127.0.0.1:9222`
+
+Output:
+
+- `pdfs/`: downloaded PDFs
+- `manifest.json`: extracted citation metadata and resolved PDF URLs
+- `summary.html`: browser-friendly download result page
+- `summary.md`: Markdown summary for sharing or archiving
+
+Notes:
+
+- the downloader first scans visible DOI / arXiv / PDF links
+- if the main page does not expose direct links, it falls back to citation badges and the right-side `Paper -> PDF` panel
+- it can reuse an existing Chrome session over CDP and auto-launch Chrome when the endpoint is unavailable
+- PDF downloads now run in parallel instead of one-by-one
+
 ## Web console features
 
 The local console in `web_app.py` is the main product surface.
@@ -325,6 +351,7 @@ The local console in `web_app.py` is the main product surface.
 - persist task metadata to disk
 - run Folo timeline fetches from the same dashboard
 - run arXiv title-matched survey generation from the same dashboard
+- run Consensus cited-PDF extraction and batch download from the same dashboard
 - save SMTP settings locally and send report attachments in bulk with one click
 
 Removed integrations:

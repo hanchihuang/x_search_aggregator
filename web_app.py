@@ -352,7 +352,7 @@ def run_report_files(run_dir: Path) -> List[Dict]:
             continue
         if path.resolve() in seen_paths:
             continue
-        if path.suffix.lower() not in {".html", ".md", ".json", ".csv", ".txt"}:
+        if path.suffix.lower() not in {".html", ".md", ".json", ".csv", ".txt", ".pdf"}:
             continue
         rel = path.resolve().relative_to(BASE_DIR).as_posix()
         items.append(
@@ -1511,6 +1511,54 @@ def run_arxiv_title_survey_job(task_id: str, keyword: str, limit: int, max_resul
     )
 
 
+def run_consensus_pdf_job(
+    task_id: str,
+    url: str,
+    headless: bool,
+    cdp_url: str,
+    auto_launch: bool,
+    max_scrolls: int,
+    scroll_pause_ms: int,
+    max_downloads: int,
+) -> None:
+    before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
+    cmd = [
+        sys.executable,
+        "consensus_pdf_downloader.py",
+        "--url",
+        url,
+        "--max-scrolls",
+        str(max_scrolls),
+        "--scroll-pause-ms",
+        str(scroll_pause_ms),
+        "--max-downloads",
+        str(max_downloads),
+        "--output-root",
+        str(OUTPUT_DIR),
+    ]
+    if headless:
+        cmd.append("--headless")
+    if cdp_url:
+        cmd.extend(["--cdp-url", cdp_url])
+    if auto_launch:
+        cmd.append("--auto-launch")
+    code = run_command_stream(task_id, cmd, "正在抓取 Consensus 页面引用并下载 PDF", 5)
+    if code != 0:
+        raise RuntimeError(explain_command_failure(task_id, "Consensus PDF 下载失败，请检查日志。"))
+
+    run_dir = detect_newest_dir(before)
+    if run_dir is None:
+        raise RuntimeError("Consensus PDF 任务完成，但未找到输出目录。")
+
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"Consensus 页面 PDF 下载完成：{url}",
+        stage="已完成",
+        progress=100,
+    )
+
+
 def worker(task_id: str) -> None:
     update_task(task_id, status="running", stage="准备启动", progress=2)
     try:
@@ -1617,6 +1665,17 @@ def worker(task_id: str) -> None:
                 params["keyword"],
                 int(params.get("limit", 10)),
                 int(params.get("max_results", 100)),
+            )
+        elif task["type"] == "consensus_pdf":
+            run_consensus_pdf_job(
+                task_id,
+                params["url"],
+                params["headless"],
+                params.get("cdp_url", ""),
+                params.get("auto_launch", True),
+                int(params.get("max_scrolls", 8)),
+                int(params.get("scroll_pause_ms", 1800)),
+                int(params.get("max_downloads", 0)),
             )
         else:
             run_email_job(task_id, params)
@@ -2103,6 +2162,36 @@ def render_page() -> str:
           </label>
           <div class="mini-note">搜索规则固定为标题字段严格匹配。输出目录会包含 `summary.html`、`survey.md`、`manifest.json`、`papers_md/` 和 `paper_notes/`；PDF 在转换成功后立即删除。</div>
           <button class="btn" type="submit">开始抓取 arXiv Survey</button>
+        </form>
+
+        <form class="panel js-task-form" data-kind="consensus_pdf">
+          <h2>下载任意 Consensus 页面里引用的 PDF</h2>
+          <p>输入任意 `consensus.app` 页面链接。系统会打开网页、提取其中引用到的 DOI / arXiv / 直接 PDF 链接，并尽量解析真实 PDF 后自动下载到同一个输出目录。</p>
+          <label>Consensus 页面链接
+            <input type="text" name="url" placeholder="https://consensus.app/search/llm-post-training/qKobDjOXQC2dC2qc06EfJA/" required />
+          </label>
+          <label>现有 Chrome CDP 地址
+            <input type="text" name="cdp_url" value="http://127.0.0.1:9222" placeholder="例如 http://127.0.0.1:9222" />
+          </label>
+          <label>最大滚动轮数
+            <input type="text" name="max_scrolls" value="8" />
+          </label>
+          <label>滚动后等待毫秒
+            <input type="text" name="scroll_pause_ms" value="1800" />
+          </label>
+          <label>最多下载多少个 PDF
+            <input type="text" name="max_downloads" value="0" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="headless" value="1" checked />
+            <span>无头模式运行</span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="auto_launch" value="1" checked />
+            <span>若 CDP 不可用则自动拉起 Chrome</span>
+          </label>
+          <div class="mini-note">`0` 表示不限制下载数量。默认会优先尝试复用 `http://127.0.0.1:9222` 的 Chrome 会话；如果该页在你的真实浏览器里已经打开并完成渲染，脚本会优先复用那个标签页。输出目录会包含 `summary.html`、`summary.md`、`manifest.json` 和 `pdfs/`。</div>
+          <button class="btn alt" type="submit">开始下载 Consensus PDF</button>
         </form>
 
         <form class="panel js-task-form" data-kind="following">
@@ -2687,6 +2776,7 @@ def render_page() -> str:
         keyword: "/api/tasks/keyword",
         x_zhihu_search: "/api/tasks/x-zhihu-search",
         arxiv_title_survey: "/api/tasks/arxiv-title-survey",
+        consensus_pdf: "/api/tasks/consensus-pdf",
         following: "/api/tasks/following",
         user_timeline: "/api/tasks/user-timeline",
         user_following: "/api/tasks/user-following",
@@ -2922,6 +3012,34 @@ def api_task_arxiv_title_survey():
             "keyword": keyword,
             "limit": limit,
             "max_results": max_results,
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/consensus-pdf")
+def api_task_consensus_pdf():
+    url = (request.form.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "Consensus 页面链接不能为空。"}), 400
+    try:
+        max_scrolls = int((request.form.get("max_scrolls") or "8").strip() or "8")
+        scroll_pause_ms = int((request.form.get("scroll_pause_ms") or "1800").strip() or "1800")
+        max_downloads = int((request.form.get("max_downloads") or "0").strip() or "0")
+    except ValueError:
+        return jsonify({"error": "滚动轮数、等待毫秒和下载数量必须是整数。"}), 400
+    if max_scrolls <= 0 or scroll_pause_ms <= 0 or max_downloads < 0:
+        return jsonify({"error": "滚动轮数和等待毫秒必须大于 0，下载数量不能小于 0。"}), 400
+    task_id = start_task(
+        "consensus_pdf",
+        {
+            "url": url,
+            "headless": request.form.get("headless") == "1",
+            "cdp_url": (request.form.get("cdp_url") or "http://127.0.0.1:9222").strip(),
+            "auto_launch": request.form.get("auto_launch", "1") == "1",
+            "max_scrolls": max_scrolls,
+            "scroll_pause_ms": scroll_pause_ms,
+            "max_downloads": max_downloads,
         },
     )
     return jsonify({"task_id": task_id})
