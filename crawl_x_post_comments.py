@@ -42,6 +42,20 @@ EXPAND_REPLY_SELECTORS = [
     'div[role="button"]:has-text("显示可能包含垃圾信息的回复")',
 ]
 
+DETAIL_RETRY_SELECTORS = [
+    'button:has-text("重试")',
+    'button:has-text("Retry")',
+    'div[role="button"]:has-text("重试")',
+    'div[role="button"]:has-text("Retry")',
+]
+
+DETAIL_ERROR_MARKERS = [
+    'span:has-text("出错了")',
+    'span:has-text("Something went wrong")',
+    'span:has-text("Try reloading")',
+    'span:has-text("请尝试重新加载")',
+]
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Crawl one X post plus all loaded comments.")
@@ -103,6 +117,38 @@ def click_expand_reply_buttons(page: Page) -> int:
     return clicked
 
 
+def wait_for_post_thread(page: Page, tweet_id: str, timeout_ms: int = 20000) -> bool:
+    deadline = datetime.now().timestamp() + max(timeout_ms, 1000) / 1000
+    while datetime.now().timestamp() < deadline:
+        cards = get_cards(page)
+        if cards:
+            for card in cards:
+                try:
+                    item = extract_tweet(card)
+                except Exception:
+                    item = None
+                if item and str(item.get("tweet_id") or "").strip() == tweet_id:
+                    return True
+            if any(f"/status/{tweet_id}" in ((a.get_attribute("href") or "").strip()) for card in cards for a in card.query_selector_all('a[href*="/status/"]')):
+                return True
+        for selector in DETAIL_RETRY_SELECTORS:
+            btn = page.query_selector(selector)
+            if not btn:
+                continue
+            try:
+                btn.click(timeout=1500)
+                page.wait_for_timeout(1800)
+                break
+            except Exception:
+                continue
+        page.wait_for_timeout(400)
+    return False
+
+
+def page_has_detail_error(page: Page) -> bool:
+    return any(page.query_selector(selector) for selector in DETAIL_ERROR_MARKERS)
+
+
 def enrich_item(item: Dict, root_tweet_id: str, position: int, is_target_post: bool) -> Dict:
     enriched = dict(item)
     enriched["conversation_root_id"] = root_tweet_id
@@ -112,13 +158,17 @@ def enrich_item(item: Dict, root_tweet_id: str, position: int, is_target_post: b
 
 
 def write_comments_csv(path: Path, post: Optional[Dict], comments: List[Dict]) -> None:
-    fields = [
+    base_fields = [
         "tweet_id",
         "url",
         "user_name",
         "user_handle",
         "posted_at",
+        "card_text",
         "text",
+        "full_text",
+        "full_text_status",
+        "full_text_fetched_at",
         "reply_count",
         "retweet_count",
         "like_count",
@@ -132,6 +182,14 @@ def write_comments_csv(path: Path, post: Optional[Dict], comments: List[Dict]) -
     if post:
         rows.append(post)
     rows.extend(comments)
+    extra_fields: List[str] = []
+    known_fields = set(base_fields)
+    for row in rows:
+        for key in row.keys():
+            if key in known_fields or key in extra_fields:
+                continue
+            extra_fields.append(key)
+    fields = base_fields + extra_fields
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -318,15 +376,78 @@ def make_checkpoint_callback(
     return checkpoint
 
 
-def hydrate_target_post(page: Page, target_tweet_id: str, fallback_post: Optional[Dict]) -> Optional[Dict]:
-    if not fallback_post:
-        return None
-    post = dict(fallback_post)
+def _extract_meta_content(page: Page, selector: str) -> str:
+    try:
+        element = page.query_selector(selector)
+        if not element:
+            return ""
+        return str(element.get_attribute("content") or "").strip()
+    except Exception:
+        return ""
+
+
+def hydrate_target_post(
+    page: Page,
+    target_tweet_id: str,
+    fallback_post: Optional[Dict],
+    source_url: str = "",
+    handle_hint: str = "",
+) -> Optional[Dict]:
+    post = dict(fallback_post or {})
+    if not post:
+        post = {
+            "tweet_id": target_tweet_id,
+            "url": source_url or page.url,
+            "user_name": "",
+            "user_handle": handle_hint,
+            "posted_at": None,
+            "text": "",
+            "reply_count": 0,
+            "retweet_count": 0,
+            "like_count": 0,
+            "bookmark_count": 0,
+            "view_count": 0,
+            "conversation_root_id": target_tweet_id,
+            "position": 0,
+            "is_target_post": True,
+        }
+
     full_text = extract_full_text_from_page(page, target_tweet_id, str(post.get("text") or ""))
     if full_text:
         post["text"] = full_text
         post["full_text"] = full_text
         post["full_text_status"] = "ok"
+    elif not post.get("text"):
+        description = _extract_meta_content(page, 'meta[property="og:description"]')
+        title = _extract_meta_content(page, 'meta[property="og:title"]')
+        candidate = description or title
+        if candidate:
+            post["text"] = candidate
+            post["full_text"] = candidate
+            post["full_text_status"] = "meta"
+
+    if not post.get("user_handle"):
+        post["user_handle"] = handle_hint
+
+    if not post.get("url"):
+        post["url"] = source_url or page.url
+
+    if not post.get("tweet_id"):
+        post["tweet_id"] = target_tweet_id
+
+    if not post.get("posted_at"):
+        try:
+            time_el = page.query_selector("time")
+            if time_el:
+                post["posted_at"] = time_el.get_attribute("datetime")
+        except Exception:
+            pass
+
+    if not post.get("user_name"):
+        title = _extract_meta_content(page, 'meta[property="og:title"]')
+        if " on X" in title:
+            post["user_name"] = title.split(" on X", 1)[0].strip()
+
     return post
 
 
@@ -334,6 +455,7 @@ def collect_post_and_comments(
     page: Page,
     post_url: str,
     target_tweet_id: str,
+    handle_hint: str,
     max_comments: int,
     max_scrolls: int,
     no_new_stop: int,
@@ -345,6 +467,9 @@ def collect_post_and_comments(
     no_new_rounds = 0
     anchor_stall_rounds = 0
     last_anchor = ""
+
+    wait_for_post_thread(page, target_tweet_id, timeout_ms=max(scroll_pause * 4, 8000))
+    page.wait_for_timeout(min(scroll_pause, 2500))
 
     for idx in range(max_scrolls):
         clicked = click_expand_reply_buttons(page)
@@ -376,14 +501,14 @@ def collect_post_and_comments(
             if max_comments > 0 and len(seen_comments) >= max_comments:
                 comments = list(seen_comments.values())
                 if target_post is None:
-                    target_post = hydrate_target_post(page, target_tweet_id, target_post)
+                    target_post = hydrate_target_post(page, target_tweet_id, target_post, post_url, handle_hint)
                 if checkpoint_cb:
                     checkpoint_cb(target_post, comments, idx, new_count)
                 print(f"Reached max comments: {max_comments}")
                 return target_post, comments
 
         if target_post is None:
-            target_post = hydrate_target_post(page, target_tweet_id, target_post)
+            target_post = hydrate_target_post(page, target_tweet_id, target_post, post_url, handle_hint)
 
         comments = list(seen_comments.values())
         print(f"Scroll {idx + 1}/{max_scrolls}: +{new_count} new, total {len(comments)}")
@@ -442,18 +567,29 @@ def main() -> None:
             page.goto(post_url, wait_until="domcontentloaded", timeout=90000)
             page.wait_for_timeout(3000)
             validate_auth_state(page)
+            if not wait_for_post_thread(page, tweet_id, timeout_ms=12000):
+                if page_has_detail_error(page):
+                    page.reload(wait_until="domcontentloaded", timeout=90000)
+                    page.wait_for_timeout(3000)
+                if not wait_for_post_thread(page, tweet_id, timeout_ms=12000):
+                    raise RuntimeError(
+                        "未检测到帖子详情线程加载成功；可能是登录态失效、页面临时报错，或 X 返回了异常页。"
+                    )
             checkpoint_cb = make_checkpoint_callback(run_dir, post_url, max(1, args.checkpoint_every))
             target_post, comments = collect_post_and_comments(
                 page=page,
                 post_url=post_url,
                 target_tweet_id=tweet_id,
+                handle_hint=handle,
                 max_comments=max(0, args.max_comments),
                 max_scrolls=max(1, args.max_scrolls),
                 no_new_stop=max(2, args.no_new_stop),
                 scroll_pause=max(600, args.scroll_pause),
                 checkpoint_cb=checkpoint_cb,
             )
-            target_post = hydrate_target_post(page, tweet_id, target_post)
+            target_post = hydrate_target_post(page, tweet_id, target_post, post_url, handle)
+            if target_post is None:
+                raise RuntimeError("帖子详情页未成功解析到目标帖子，已停止输出空结果。")
             checkpoint_outputs(run_dir, post_url, target_post, comments)
             print(f"成功收集 {len(comments)} 条评论")
             print(f"Results saved to: {run_dir}")
