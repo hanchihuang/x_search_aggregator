@@ -108,7 +108,7 @@ def wait_for_consensus_page(page: Page, timeout_ms: int = 60000) -> None:
         if "just a moment" not in title and "enable javascript and cookies to continue" not in body_text:
             return
         page.wait_for_timeout(1500)
-    raise RuntimeError("Consensus 页面长时间停留在 Cloudflare/挑战页，未能进入实际内容。")
+    raise RuntimeError("Consensus 页面长时间停留在 Cloudflare/挑战页，未能进入实际内容。请先在同一个 Chrome 会话里手动打开目标页面并确认可正常浏览，再通过 CDP 重试。")
 
 
 def looks_like_reference_skeleton(page: Page) -> bool:
@@ -138,28 +138,33 @@ def maybe_activate_reference_views(page: Page) -> None:
             pass
 
 
-def find_existing_consensus_page(browser, target_url: str) -> Page | None:
+def find_existing_consensus_page(browser, target_url: str) -> tuple[Page | None, str]:
     target = target_url.rstrip("/")
+    fallback_page = None
     for context in browser.contexts:
         for page in context.pages:
             current = (page.url or "").rstrip("/")
             if current == target:
-                return page
-    return None
+                return page, "exact"
+            if "consensus.app/" in current and fallback_page is None:
+                fallback_page = page
+    if fallback_page is not None:
+        return fallback_page, "same-site"
+    return None, "none"
 
 
 def build_browser_and_page(playwright, cdp_url: str, headless: bool, target_url: str):
     if cdp_url:
         browser = playwright.chromium.connect_over_cdp(cdp_url, timeout=15000)
-        existing_page = find_existing_consensus_page(browser, target_url)
+        existing_page, reuse_mode = find_existing_consensus_page(browser, target_url)
         if existing_page is not None:
-            return browser, existing_page, True
+            return browser, existing_page, reuse_mode
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
-        return browser, page, False
+        return browser, page, "new"
     browser = playwright.chromium.launch(**get_playwright_launch_kwargs(headless=headless))
     page = browser.new_page()
-    return browser, page, False
+    return browser, page, "fresh-browser"
 
 
 def extract_reference_candidates(page: Page) -> List[Dict]:
@@ -628,10 +633,13 @@ def main() -> None:
                 if chrome_proc.stderr and chrome_proc.poll() is not None:
                     stderr = chrome_proc.stderr.read().strip() or "(empty)"
                 raise SystemExit(f"CDP 地址在 {args.wait_seconds}s 内仍未就绪: {cdp_url}\nChrome stderr:\n{stderr}")
-        browser, page, reused_existing_page = build_browser_and_page(playwright, cdp_url, args.headless, args.url)
+        browser, page, reuse_mode = build_browser_and_page(playwright, cdp_url, args.headless, args.url)
         print(f"[OPEN] {args.url}")
-        if reused_existing_page:
-            print("[CDP] 已复用现有 Chrome 中已打开的 Consensus 标签页。")
+        if reuse_mode in {"exact", "same-site"}:
+            if reuse_mode == "exact":
+                print("[CDP] 已复用现有 Chrome 中已打开的目标 Consensus 标签页。")
+            else:
+                print("[CDP] 已复用现有 Chrome 中任意一个已打开的 Consensus 标签页，并将在该页内切换到目标链接。")
             try:
                 page.bring_to_front()
             except Exception:
@@ -641,7 +649,7 @@ def main() -> None:
                 page.goto(args.url, wait_until="domcontentloaded", timeout=120000)
         else:
             if cdp_url:
-                print("[CDP] 未找到已打开标签页，将在现有 Chrome 会话中新开页面。")
+                print("[CDP] 未找到任何已打开的 Consensus 标签页，将在现有 Chrome 会话中新开页面。")
             page.goto(args.url, wait_until="domcontentloaded", timeout=120000)
         wait_for_consensus_page(page)
         maybe_activate_reference_views(page)
