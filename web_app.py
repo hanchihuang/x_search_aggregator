@@ -1517,6 +1517,7 @@ def run_consensus_pdf_job(
     headless: bool,
     cdp_url: str,
     auto_launch: bool,
+    reuse_only: bool,
     max_scrolls: int,
     scroll_pause_ms: int,
     max_downloads: int,
@@ -1542,6 +1543,8 @@ def run_consensus_pdf_job(
         cmd.extend(["--cdp-url", cdp_url])
     if auto_launch:
         cmd.append("--auto-launch")
+    if reuse_only:
+        cmd.append("--reuse-only")
     code = run_command_stream(task_id, cmd, "正在抓取 Consensus 页面引用并下载 PDF", 5)
     if code != 0:
         raise RuntimeError(explain_command_failure(task_id, "Consensus PDF 下载失败，请检查日志。"))
@@ -1673,6 +1676,7 @@ def worker(task_id: str) -> None:
                 params["headless"],
                 params.get("cdp_url", ""),
                 params.get("auto_launch", True),
+                params.get("reuse_only", True),
                 int(params.get("max_scrolls", 8)),
                 int(params.get("scroll_pause_ms", 1800)),
                 int(params.get("max_downloads", 0)),
@@ -2190,7 +2194,11 @@ def render_page() -> str:
             <input type="checkbox" name="auto_launch" value="1" checked />
             <span>若 CDP 不可用则自动拉起 Chrome</span>
           </label>
-          <div class="mini-note">`0` 表示不限制下载数量。默认会优先尝试复用 `http://127.0.0.1:9222` 的 Chrome 会话；如果该页在你的真实浏览器里已经打开并完成渲染，脚本会优先复用那个标签页。输出目录会包含 `summary.html`、`summary.md`、`manifest.json` 和 `pdfs/`。</div>
+          <label class="checkbox">
+            <input type="checkbox" name="reuse_only" value="1" checked />
+            <span>只复用已打开的 Consensus 标签页，不自动新开页</span>
+          </label>
+          <div class="mini-note">`0` 表示不限制下载数量。默认会优先复用 `http://127.0.0.1:9222` 里已打开的 Consensus 标签页；如果检测到登录页，会立即提示你先在该 Chrome 会话中登录，而不是继续空等。输出目录会包含 `summary.html`、`summary.md`、`manifest.json` 和 `pdfs/`。</div>
           <button class="btn alt" type="submit">开始下载 Consensus PDF</button>
         </form>
 
@@ -3037,6 +3045,7 @@ def api_task_consensus_pdf():
             "headless": request.form.get("headless") == "1",
             "cdp_url": (request.form.get("cdp_url") or "http://127.0.0.1:9222").strip(),
             "auto_launch": request.form.get("auto_launch", "1") == "1",
+            "reuse_only": request.form.get("reuse_only", "1") == "1",
             "max_scrolls": max_scrolls,
             "scroll_pause_ms": scroll_pause_ms,
             "max_downloads": max_downloads,

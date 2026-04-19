@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-downloads", type=int, default=0, help="0 means no limit")
     parser.add_argument("--cdp-url", default="", help="Optional existing Chrome CDP URL")
     parser.add_argument("--auto-launch", action="store_true", help="Auto launch Chrome with remote debugging when CDP is unavailable")
+    parser.add_argument("--reuse-only", action="store_true", help="Only reuse an already-open Consensus tab; do not open a new tab automatically")
     parser.add_argument("--chrome-path", default="/usr/bin/google-chrome", help="Chrome executable path for auto-launch")
     parser.add_argument("--user-data-dir", default="chrome_profile_consensus", help="Chrome profile dir used for auto-launch")
     parser.add_argument("--wait-seconds", type=int, default=20, help="Seconds to wait for CDP readiness after auto-launch")
@@ -125,6 +126,19 @@ def looks_like_reference_skeleton(page: Page) -> bool:
     return False
 
 
+def is_consensus_login_page(page: Page) -> bool:
+    title = safe_page_title(page).lower()
+    body_text = safe_body_text(page, timeout=2000).lower()
+    current_url = (page.url or "").lower()
+    if "/login" in current_url or "/sign-in" in current_url or "/sign_up" in current_url:
+        return True
+    if "sign up - consensus" in title or "sign in - consensus" in title:
+        return True
+    if "sign in" in body_text and "sign up" in body_text and "research starts here" in body_text:
+        return True
+    return False
+
+
 def maybe_activate_reference_views(page: Page) -> None:
     for label in ("References", "Sources", "Corpus"):
         locator = page.locator("button", has_text=label)
@@ -153,12 +167,14 @@ def find_existing_consensus_page(browser, target_url: str) -> tuple[Page | None,
     return None, "none"
 
 
-def build_browser_and_page(playwright, cdp_url: str, headless: bool, target_url: str):
+def build_browser_and_page(playwright, cdp_url: str, headless: bool, target_url: str, reuse_only: bool):
     if cdp_url:
         browser = playwright.chromium.connect_over_cdp(cdp_url, timeout=15000)
         existing_page, reuse_mode = find_existing_consensus_page(browser, target_url)
         if existing_page is not None:
             return browser, existing_page, reuse_mode
+        if reuse_only:
+            return browser, None, "reuse-only-miss"
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
         return browser, page, "new"
@@ -633,7 +649,10 @@ def main() -> None:
                 if chrome_proc.stderr and chrome_proc.poll() is not None:
                     stderr = chrome_proc.stderr.read().strip() or "(empty)"
                 raise SystemExit(f"CDP 地址在 {args.wait_seconds}s 内仍未就绪: {cdp_url}\nChrome stderr:\n{stderr}")
-        browser, page, reuse_mode = build_browser_and_page(playwright, cdp_url, args.headless, args.url)
+        browser, page, reuse_mode = build_browser_and_page(playwright, cdp_url, args.headless, args.url, args.reuse_only)
+        if page is None:
+            browser.close()
+            raise SystemExit("当前 CDP 会话里没有已打开的 Consensus 标签页。请先在这个 Chrome 会话里手动打开并登录目标页面，再重试。")
         print(f"[OPEN] {args.url}")
         if reuse_mode in {"exact", "same-site"}:
             if reuse_mode == "exact":
@@ -651,7 +670,13 @@ def main() -> None:
             if cdp_url:
                 print("[CDP] 未找到任何已打开的 Consensus 标签页，将在现有 Chrome 会话中新开页面。")
             page.goto(args.url, wait_until="domcontentloaded", timeout=120000)
+        if is_consensus_login_page(page):
+            browser.close()
+            raise SystemExit("当前打开的是 Consensus 登录页。请先在同一个 Chrome 会话里完成登录，并确认目标页面可正常浏览后再重试。")
         wait_for_consensus_page(page)
+        if is_consensus_login_page(page):
+            browser.close()
+            raise SystemExit("Consensus 页面跳回了登录态。请先在同一个 Chrome 会话里完成登录，并保持该标签页可正常浏览后再重试。")
         maybe_activate_reference_views(page)
         extracted = collect_reference_candidates(page, args.max_scrolls, args.scroll_pause_ms)
         if not extracted and not looks_like_reference_skeleton(page):
